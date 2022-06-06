@@ -33,7 +33,7 @@ dependencies = [
  "slog-term",
  "slot_clock",
  "tempfile",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
  "validator_dir",
 ]
@@ -621,7 +621,7 @@ dependencies = [
  "strum",
  "task_executor",
  "tempfile",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tree_hash",
  "types",
 ]
@@ -658,7 +658,7 @@ dependencies = [
  "slog-term",
  "store",
  "task_executor",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
 ]
 
@@ -858,7 +858,7 @@ dependencies = [
  "slog-stdlog",
  "slog-term",
  "sloggers",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
 ]
 
@@ -1115,7 +1115,7 @@ dependencies = [
  "task_executor",
  "time 0.2.25",
  "timer",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "toml",
  "tree_hash",
  "types",
@@ -1652,7 +1652,7 @@ dependencies = [
  "rlp 0.5.0",
  "sha2 0.9.3",
  "smallvec",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-stream",
  "tokio-util 0.6.3",
  "tracing",
@@ -1684,7 +1684,7 @@ dependencies = [
  "rlp 0.5.0",
  "sha2 0.9.3",
  "smallvec",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-stream",
  "tokio-util 0.6.3",
  "tracing",
@@ -1858,7 +1858,7 @@ dependencies = [
  "slog-term",
  "sloggers",
  "task_executor",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
 ]
 
@@ -1897,7 +1897,7 @@ dependencies = [
  "sloggers",
  "state_processing",
  "task_executor",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-compat-02",
  "toml",
  "tree_hash",
@@ -1912,7 +1912,7 @@ dependencies = [
  "deposit_contract",
  "futures 0.3.13",
  "serde_json",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-compat-02",
  "types",
  "web3",
@@ -2052,7 +2052,7 @@ dependencies = [
  "task_executor",
  "tempfile",
  "tiny-keccak 2.0.2",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-io-timeout",
  "tokio-util 0.6.3",
  "types",
@@ -2537,7 +2537,7 @@ dependencies = [
  "serde_derive",
  "slog",
  "state_processing",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-compat-02",
  "tree_hash",
  "types",
@@ -2667,7 +2667,7 @@ dependencies = [
  "http",
  "indexmap",
  "slab",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-util 0.6.3",
  "tracing",
 ]
@@ -2701,7 +2701,7 @@ name = "hashset_delay"
 version = "0.2.0"
 dependencies = [
  "futures 0.3.13",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-util 0.6.3",
 ]
 
@@ -2867,7 +2867,7 @@ dependencies = [
  "slot_clock",
  "state_processing",
  "store",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-stream",
  "tokio-util 0.6.3",
  "tree_hash",
@@ -2893,7 +2893,7 @@ dependencies = [
  "slog",
  "slot_clock",
  "store",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
  "warp",
  "warp_utils",
@@ -2935,7 +2935,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_regex",
- "tokio 1.2.0",
+ "tokio 1.8.4",
 ]
 
 [[package]]
@@ -2986,7 +2986,7 @@ dependencies = [
  "itoa",
  "pin-project 1.0.5",
  "socket2",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tower-service",
  "tracing",
  "want",
@@ -3032,7 +3032,7 @@ dependencies = [
  "bytes 1.0.1",
  "hyper 0.14.4",
  "native-tls",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-native-tls",
 ]
 
@@ -3362,7 +3362,7 @@ dependencies = [
  "serde_yaml",
  "simple_logger",
  "state_processing",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tree_hash",
  "types",
  "validator_dir",
@@ -3634,7 +3634,7 @@ dependencies = [
  "libp2p-core",
  "log",
  "socket2",
- "tokio 1.2.0",
+ "tokio 1.8.4",
 ]
 
 [[package]]
@@ -3734,7 +3734,7 @@ dependencies = [
  "slog-term",
  "sloggers",
  "tempfile",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
  "validator_client",
  "validator_dir",
@@ -4169,7 +4169,7 @@ dependencies = [
  "strum",
  "task_executor",
  "tempfile",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-stream",
  "tokio-util 0.6.3",
  "tree_hash",
@@ -5186,7 +5186,7 @@ dependencies = [
  "remote_signer_test",
  "reqwest",
  "serde",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
 ]
 
@@ -5204,7 +5204,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
 ]
 
@@ -5243,7 +5243,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-native-tls",
  "url",
  "wasm-bindgen",
@@ -5744,7 +5744,7 @@ dependencies = [
  "node_test_rig",
  "parking_lot",
  "rayon",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
  "validator_client",
 ]
@@ -5802,7 +5802,7 @@ dependencies = [
  "slot_clock",
  "state_processing",
  "task_executor",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-stream",
  "types",
 ]
@@ -6258,7 +6258,7 @@ dependencies = [
  "lazy_static",
  "lighthouse_metrics",
  "slog",
- "tokio 1.2.0",
+ "tokio 1.8.4",
 ]
 
 [[package]]
@@ -6419,7 +6419,7 @@ dependencies = [
  "slog",
  "slot_clock",
  "task_executor",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
 ]
 
@@ -6521,9 +6521,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.2.0"
+version = "1.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8190d04c665ea9e6b6a0dc45523ade572c088d2e6566244c1122671dbf4ae3a"
+checksum = "50dae83881bc9b0403dd5b44ea9deed3e939856cc8722d5be37f0d6e5c6d53dd"
 dependencies = [
  "autocfg 1.0.1",
  "bytes 1.0.1",
@@ -6559,7 +6559,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90c49f106be240de154571dd31fbe48acb10ba6c6dd6f6517ad603abffa42de9"
 dependencies = [
  "pin-project-lite 0.2.6",
- "tokio 1.2.0",
+ "tokio 1.8.4",
 ]
 
 [[package]]
@@ -6591,7 +6591,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7d995660bd2b7f8c1568414c1126076c13fbb725c40112dc0120b78eb9b717b"
 dependencies = [
  "native-tls",
- "tokio 1.2.0",
+ "tokio 1.8.4",
 ]
 
 [[package]]
@@ -6602,7 +6602,7 @@ checksum = "1981ad97df782ab506a1f43bf82c967326960d278acf3bf8279809648c3ff3ea"
 dependencies = [
  "futures-core",
  "pin-project-lite 0.2.6",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-util 0.6.3",
 ]
 
@@ -6625,7 +6625,7 @@ dependencies = [
  "futures-util",
  "log",
  "pin-project 1.0.5",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tungstenite",
 ]
 
@@ -6671,7 +6671,7 @@ dependencies = [
  "log",
  "pin-project-lite 0.2.6",
  "slab",
- "tokio 1.2.0",
+ "tokio 1.8.4",
 ]
 
 [[package]]
@@ -7092,7 +7092,7 @@ dependencies = [
  "slog-term",
  "slot_clock",
  "tempfile",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tree_hash",
  "types",
  "validator_dir",
@@ -7204,7 +7204,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util 0.6.3",
@@ -7225,7 +7225,7 @@ dependencies = [
  "safe_arith",
  "serde",
  "state_processing",
- "tokio 1.2.0",
+ "tokio 1.8.4",
  "types",
  "warp",
 ]
