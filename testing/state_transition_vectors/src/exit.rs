@@ -1,9 +1,9 @@
 use super::*;
 use state_processing::{
-    per_block_processing, per_block_processing::errors::ExitInvalid,
-    test_utils::BlockProcessingBuilder, BlockProcessingError, BlockSignatureStrategy,
+    per_block_processing, per_block_processing::errors::ExitInvalid, BlockProcessingError,
+    BlockSignatureStrategy, ConsensusContext, VerifyBlockRoot,
 };
-use types::{BeaconBlock, BeaconState, Epoch, EthSpec, SignedBeaconBlock};
+use types::{BeaconBlock, Epoch};
 
 // Default validator index to exit.
 pub const VALIDATOR_INDEX: u64 = 0;
@@ -14,8 +14,11 @@ struct ExitTest {
     validator_index: u64,
     exit_epoch: Epoch,
     state_epoch: Epoch,
-    block_modifier: Box<dyn FnOnce(&mut BeaconBlock<E>)>,
-    builder_modifier: Box<dyn FnOnce(BlockProcessingBuilder<E>) -> BlockProcessingBuilder<E>>,
+    #[allow(clippy::type_complexity)]
+    state_modifier: Box<dyn FnOnce(&mut BeaconState<E>)>,
+    #[allow(clippy::type_complexity)]
+    block_modifier:
+        Box<dyn FnOnce(&BeaconChainHarness<EphemeralHarnessType<E>>, &mut BeaconBlock<E>)>,
     #[allow(dead_code)]
     expected: Result<(), BlockProcessingError>,
 }
@@ -26,45 +29,58 @@ impl Default for ExitTest {
             validator_index: VALIDATOR_INDEX,
             exit_epoch: STATE_EPOCH,
             state_epoch: STATE_EPOCH,
-            block_modifier: Box::new(|_| ()),
-            builder_modifier: Box::new(|x| x),
+            state_modifier: Box::new(|_| ()),
+            block_modifier: Box::new(|_, _| ()),
             expected: Ok(()),
         }
     }
 }
 
 impl ExitTest {
-    fn block_and_pre_state(self) -> (SignedBeaconBlock<E>, BeaconState<E>) {
-        let spec = &E::default_spec();
-
-        (self.builder_modifier)(
-            get_builder(spec, self.state_epoch.as_u64(), VALIDATOR_COUNT)
-                .insert_exit(self.validator_index, self.exit_epoch)
-                .modify(self.block_modifier),
+    async fn block_and_pre_state(self) -> (SignedBeaconBlock<E>, BeaconState<E>) {
+        let harness = get_harness::<E>(
+            self.state_epoch.start_slot(E::slots_per_epoch()),
+            VALIDATOR_COUNT,
         )
-        .build(None, None)
+        .await;
+        let mut state = harness.get_current_state();
+        (self.state_modifier)(&mut state);
+
+        let block_modifier = self.block_modifier;
+        let validator_index = self.validator_index;
+        let exit_epoch = self.exit_epoch;
+
+        let (signed_block, state) = harness
+            .make_block_with_modifier(state.clone(), state.slot() + 1, |block| {
+                harness.add_voluntary_exit(block, validator_index, exit_epoch);
+                block_modifier(&harness, block);
+            })
+            .await;
+        ((*signed_block.0).clone(), state)
     }
 
     fn process(
         block: &SignedBeaconBlock<E>,
         state: &mut BeaconState<E>,
     ) -> Result<(), BlockProcessingError> {
+        let mut ctxt = ConsensusContext::new(block.slot());
         per_block_processing(
             state,
             block,
-            None,
             BlockSignatureStrategy::VerifyIndividual,
+            VerifyBlockRoot::True,
+            &mut ctxt,
             &E::default_spec(),
         )
     }
 
-    #[cfg(test)]
-    fn run(self) -> BeaconState<E> {
+    #[cfg(all(test, not(debug_assertions)))]
+    async fn run(self) -> BeaconState<E> {
         let spec = &E::default_spec();
         let expected = self.expected.clone();
         assert_eq!(STATE_EPOCH, spec.shard_committee_period);
 
-        let (block, mut state) = self.block_and_pre_state();
+        let (block, mut state) = self.block_and_pre_state().await;
 
         let result = Self::process(&block, &mut state);
 
@@ -73,8 +89,8 @@ impl ExitTest {
         state
     }
 
-    fn test_vector(self, title: String) -> TestVector {
-        let (block, pre_state) = self.block_and_pre_state();
+    async fn test_vector(self, title: String) -> TestVector {
+        let (block, pre_state) = self.block_and_pre_state().await;
         let mut post_state = pre_state.clone();
         let (post_state, error) = match Self::process(&block, &mut post_state) {
             Ok(_) => (Some(post_state), None),
@@ -83,8 +99,8 @@ impl ExitTest {
 
         TestVector {
             title,
-            block,
             pre_state,
+            block,
             post_state,
             error,
         }
@@ -95,23 +111,22 @@ vectors_and_tests!(
     // Ensures we can process a valid exit,
     valid_single_exit,
     ExitTest::default(),
-    // Tests three exists in the same block.
+    // Tests three exits in the same block.
     valid_three_exits,
     ExitTest {
-        builder_modifier: Box::new(|builder| {
-            builder
-                .insert_exit(1, STATE_EPOCH)
-                .insert_exit(2, STATE_EPOCH)
+        block_modifier: Box::new(|harness, block| {
+            harness.add_voluntary_exit(block, 1, STATE_EPOCH);
+            harness.add_voluntary_exit(block, 2, STATE_EPOCH);
         }),
         ..ExitTest::default()
     },
     // Ensures that a validator cannot be exited twice in the same block.
     invalid_duplicate,
     ExitTest {
-        block_modifier: Box::new(|block| {
+        block_modifier: Box::new(|_, block| {
             // Duplicate the exit
-            let exit = block.body.voluntary_exits[0].clone();
-            block.body.voluntary_exits.push(exit).unwrap();
+            let exit = block.body().voluntary_exits().first().unwrap().clone();
+            block.body_mut().voluntary_exits_mut().push(exit).unwrap();
         }),
         expected: Err(BlockProcessingError::ExitInvalid {
             index: 1,
@@ -128,8 +143,14 @@ vectors_and_tests!(
     // ```
     invalid_validator_unknown,
     ExitTest {
-        block_modifier: Box::new(|block| {
-            block.body.voluntary_exits[0].message.validator_index = VALIDATOR_COUNT as u64;
+        block_modifier: Box::new(|_, block| {
+            block
+                .body_mut()
+                .voluntary_exits_mut()
+                .get_mut(0)
+                .unwrap()
+                .message
+                .validator_index = VALIDATOR_COUNT as u64;
         }),
         expected: Err(BlockProcessingError::ExitInvalid {
             index: 0,
@@ -147,9 +168,8 @@ vectors_and_tests!(
     // ```
     invalid_exit_already_initiated,
     ExitTest {
-        builder_modifier: Box::new(|mut builder| {
-            builder.state.validators[0].exit_epoch = STATE_EPOCH + 1;
-            builder
+        state_modifier: Box::new(|state| {
+            state.validators_mut().get_mut(0).unwrap().exit_epoch = STATE_EPOCH + 1;
         }),
         expected: Err(BlockProcessingError::ExitInvalid {
             index: 0,
@@ -167,9 +187,9 @@ vectors_and_tests!(
     // ```
     invalid_not_active_before_activation_epoch,
     ExitTest {
-        builder_modifier: Box::new(|mut builder| {
-            builder.state.validators[0].activation_epoch = builder.spec.far_future_epoch;
-            builder
+        state_modifier: Box::new(|state| {
+            state.validators_mut().get_mut(0).unwrap().activation_epoch =
+                E::default_spec().far_future_epoch;
         }),
         expected: Err(BlockProcessingError::ExitInvalid {
             index: 0,
@@ -187,9 +207,8 @@ vectors_and_tests!(
     // ```
     invalid_not_active_after_exit_epoch,
     ExitTest {
-        builder_modifier: Box::new(|mut builder| {
-            builder.state.validators[0].exit_epoch = STATE_EPOCH;
-            builder
+        state_modifier: Box::new(|state| {
+            state.validators_mut().get_mut(0).unwrap().exit_epoch = STATE_EPOCH;
         }),
         expected: Err(BlockProcessingError::ExitInvalid {
             index: 0,
@@ -286,10 +305,16 @@ vectors_and_tests!(
     // ```
     invalid_bad_signature,
     ExitTest {
-        block_modifier: Box::new(|block| {
+        block_modifier: Box::new(|_, block| {
             // Shift the validator index by 1 so that it's mismatched from the key that was
             // used to sign.
-            block.body.voluntary_exits[0].message.validator_index = VALIDATOR_INDEX + 1;
+            block
+                .body_mut()
+                .voluntary_exits_mut()
+                .get_mut(0)
+                .unwrap()
+                .message
+                .validator_index = VALIDATOR_INDEX + 1;
         }),
         expected: Err(BlockProcessingError::ExitInvalid {
             index: 0,
@@ -299,14 +324,14 @@ vectors_and_tests!(
     }
 );
 
-#[cfg(test)]
+#[cfg(all(test, not(debug_assertions)))]
 mod custom_tests {
     use super::*;
 
     fn assert_exited(state: &BeaconState<E>, validator_index: usize) {
         let spec = E::default_spec();
 
-        let validator = &state.validators[validator_index];
+        let validator = &state.validators().get(validator_index).unwrap();
         assert_eq!(
             validator.exit_epoch,
             // This is correct until we exceed the churn limit. If that happens, we
@@ -321,23 +346,23 @@ mod custom_tests {
         );
     }
 
-    #[test]
-    fn valid() {
-        let state = ExitTest::default().run();
+    #[tokio::test]
+    async fn valid() {
+        let state = ExitTest::default().run().await;
         assert_exited(&state, VALIDATOR_INDEX as usize);
     }
 
-    #[test]
-    fn valid_three() {
+    #[tokio::test]
+    async fn valid_three() {
         let state = ExitTest {
-            builder_modifier: Box::new(|builder| {
-                builder
-                    .insert_exit(1, STATE_EPOCH)
-                    .insert_exit(2, STATE_EPOCH)
+            block_modifier: Box::new(|harness, block| {
+                harness.add_voluntary_exit(block, 1, STATE_EPOCH);
+                harness.add_voluntary_exit(block, 2, STATE_EPOCH);
             }),
             ..ExitTest::default()
         }
-        .run();
+        .run()
+        .await;
 
         for i in &[VALIDATOR_INDEX, 1, 2] {
             assert_exited(&state, *i as usize);

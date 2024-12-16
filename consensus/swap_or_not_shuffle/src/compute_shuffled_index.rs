@@ -1,5 +1,5 @@
 use crate::Hash256;
-use eth2_hashing::{Context, SHA256};
+use ethereum_hashing::{Context, Sha256Context};
 use std::cmp::max;
 
 /// Return `p(index)` in a pseudorandom permutation `p` of `0...list_size-1` with ``seed`` as entropy.
@@ -17,7 +17,7 @@ use std::cmp::max;
 ///  - `list_size == 0`
 ///  - `index >= list_size`
 ///  - `list_size > 2**24`
-///  - `list_size > usize::max_value() / 2`
+///  - `list_size > usize::MAX / 2`
 pub fn compute_shuffled_index(
     index: usize,
     list_size: usize,
@@ -26,7 +26,7 @@ pub fn compute_shuffled_index(
 ) -> Option<usize> {
     if list_size == 0
         || index >= list_size
-        || list_size > usize::max_value() / 2
+        || list_size > usize::MAX / 2
         || list_size > 2_usize.pow(24)
     {
         return None;
@@ -54,7 +54,7 @@ fn do_round(seed: &[u8], index: usize, pivot: usize, round: u8, list_size: usize
 }
 
 fn hash_with_round_and_position(seed: &[u8], round: u8, position: usize) -> Hash256 {
-    let mut context = Context::new(&SHA256);
+    let mut context = Context::new();
 
     context.update(seed);
     context.update(&[round]);
@@ -64,17 +64,17 @@ fn hash_with_round_and_position(seed: &[u8], round: u8, position: usize) -> Hash
      */
     context.update(&(position / 256).to_le_bytes()[0..4]);
 
-    let digest = context.finish();
+    let digest = context.finalize();
     Hash256::from_slice(digest.as_ref())
 }
 
 fn hash_with_round(seed: &[u8], round: u8) -> Hash256 {
-    let mut context = Context::new(&SHA256);
+    let mut context = Context::new();
 
     context.update(seed);
     context.update(&[round]);
 
-    let digest = context.finish();
+    let digest = context.finalize();
     Hash256::from_slice(digest.as_ref())
 }
 
@@ -87,7 +87,7 @@ fn bytes_to_int64(slice: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethereum_types::H256 as Hash256;
+    use alloy_primitives::B256 as Hash256;
 
     #[test]
     #[ignore]
@@ -140,7 +140,7 @@ mod tests {
     fn returns_none_for_too_large_list() {
         assert_eq!(
             None,
-            compute_shuffled_index(100, usize::max_value() / 2, &[42, 42], 90)
+            compute_shuffled_index(100, usize::MAX / 2, &[42, 42], 90)
         );
     }
 }

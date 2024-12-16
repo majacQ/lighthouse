@@ -4,25 +4,30 @@
 
 use beacon_node::ProductionBeaconNode;
 use environment::RuntimeContext;
-use eth2::{
-    reqwest::{ClientBuilder, Url},
-    BeaconNodeHttpClient,
-};
+use eth2::{reqwest::ClientBuilder, BeaconNodeHttpClient, Timeouts};
+use sensitive_url::SensitiveUrl;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{Builder as TempBuilder, TempDir};
+use tokio::time::timeout;
 use types::EthSpec;
 use validator_client::ProductionValidatorClient;
 use validator_dir::insecure_keys::build_deterministic_validator_dirs;
 
 pub use beacon_node::{ClientConfig, ClientGenesis, ProductionClient};
+pub use beacon_node_fallback::ApiTopic;
 pub use environment;
 pub use eth2;
+pub use execution_layer::test_utils::{
+    Config as MockServerConfig, MockExecutionConfig, MockServer,
+};
 pub use validator_client::Config as ValidatorConfig;
 
 /// The global timeout for HTTP requests to the beacon node.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(4);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+/// The timeout for a beacon node to start up.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Provides a beacon node that is running in the current process on a given tokio executor (it
 /// is _local_ to this process).
@@ -47,15 +52,19 @@ impl<E: EthSpec> LocalBeaconNode<E> {
             .tempdir()
             .expect("should create temp directory for client datadir");
 
-        client_config.data_dir = datadir.path().into();
+        client_config.set_data_dir(datadir.path().into());
         client_config.network.network_dir = PathBuf::from(datadir.path()).join("network");
 
-        ProductionBeaconNode::new(context, client_config)
-            .await
-            .map(move |client| Self {
-                client: client.into_inner(),
-                datadir,
-            })
+        timeout(
+            STARTUP_TIMEOUT,
+            ProductionBeaconNode::new(context, client_config),
+        )
+        .await
+        .map_err(|_| format!("Beacon node startup timed out after {:?}", STARTUP_TIMEOUT))?
+        .map(move |client| Self {
+            client: client.into_inner(),
+            datadir,
+        })
     }
 }
 
@@ -68,9 +77,10 @@ impl<E: EthSpec> LocalBeaconNode<E> {
             .http_api_listen_addr()
             .ok_or("A remote beacon node must have a http server")?;
 
-        let beacon_node_url: Url = format!("http://{}:{}", listen_addr.ip(), listen_addr.port())
-            .parse()
-            .map_err(|e| format!("Unable to parse beacon node URL: {:?}", e))?;
+        let beacon_node_url: SensitiveUrl = SensitiveUrl::parse(
+            format!("http://{}:{}", listen_addr.ip(), listen_addr.port()).as_str(),
+        )
+        .map_err(|e| format!("Unable to parse beacon node URL: {:?}", e))?;
         let beacon_node_http_client = ClientBuilder::new()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -78,6 +88,7 @@ impl<E: EthSpec> LocalBeaconNode<E> {
         Ok(BeaconNodeHttpClient::from_components(
             beacon_node_url,
             beacon_node_http_client,
+            Timeouts::set_all(HTTP_TIMEOUT),
         ))
     }
 }
@@ -86,13 +97,12 @@ pub fn testing_client_config() -> ClientConfig {
     let mut client_config = ClientConfig::default();
 
     // Setting ports to `0` means that the OS will choose some available port.
-    client_config.network.libp2p_port = 0;
-    client_config.network.discovery_port = 0;
+    client_config
+        .network
+        .set_ipv4_listening_address(std::net::Ipv4Addr::UNSPECIFIED, 0, 0, 0);
     client_config.network.upnp_enabled = false;
     client_config.http_api.enabled = true;
     client_config.http_api.listen_port = 0;
-
-    client_config.dummy_eth1_backend = true;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,6 +113,14 @@ pub fn testing_client_config() -> ClientConfig {
         validator_count: 8,
         genesis_time: now,
     };
+
+    // Simulator tests expect historic states to be available for post-run checks.
+    client_config.chain.reconstruct_historic_states = true;
+
+    // Specify a constant count of beacon processor workers. Having this number
+    // too low can cause annoying HTTP timeouts, especially on Github runners
+    // with 2 logical CPUs.
+    client_config.beacon_processor.max_workers = 4;
 
     client_config
 }
@@ -162,8 +180,8 @@ impl ValidatorFiles {
 /// is _local_ to this process).
 ///
 /// Intended for use in testing and simulation. Not for production.
-pub struct LocalValidatorClient<T: EthSpec> {
-    pub client: ProductionValidatorClient<T>,
+pub struct LocalValidatorClient<E: EthSpec> {
+    pub client: ProductionValidatorClient<E>,
     pub files: ValidatorFiles,
 }
 
@@ -201,13 +219,38 @@ impl<E: EthSpec> LocalValidatorClient<E> {
         config.validator_dir = files.validator_dir.path().into();
         config.secrets_dir = files.secrets_dir.path().into();
 
-        ProductionValidatorClient::new(context, config)
+        let mut client = ProductionValidatorClient::new(context, config).await?;
+
+        client
+            .start_service()
             .await
-            .map(move |mut client| {
-                client
-                    .start_service()
-                    .expect("should start validator services");
-                Self { client, files }
-            })
+            .expect("should start validator services");
+        Ok(Self { client, files })
+    }
+}
+
+/// Provides an execution engine api server that is running in the current process on a given tokio executor (it
+/// is _local_ to this process).
+///
+/// Intended for use in testing and simulation. Not for production.
+pub struct LocalExecutionNode<E: EthSpec> {
+    pub server: MockServer<E>,
+    pub datadir: TempDir,
+}
+
+impl<E: EthSpec> LocalExecutionNode<E> {
+    pub fn new(context: RuntimeContext<E>, config: MockExecutionConfig) -> Self {
+        let datadir = TempBuilder::new()
+            .prefix("lighthouse_node_test_rig_el")
+            .tempdir()
+            .expect("should create temp directory for client datadir");
+        let jwt_file_path = datadir.path().join("jwt.hex");
+        if let Err(e) = std::fs::write(jwt_file_path, config.jwt_key.hex_string()) {
+            panic!("Failed to write jwt file {}", e);
+        }
+        Self {
+            server: MockServer::new_with_config(&context.executor.handle().unwrap(), config, None),
+            datadir,
+        }
     }
 }

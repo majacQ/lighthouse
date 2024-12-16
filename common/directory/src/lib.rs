@@ -10,6 +10,7 @@ pub const DEFAULT_NETWORK_DIR: &str = "network";
 pub const DEFAULT_VALIDATOR_DIR: &str = "validators";
 pub const DEFAULT_SECRET_DIR: &str = "secrets";
 pub const DEFAULT_WALLET_DIR: &str = "wallets";
+pub const DEFAULT_TRACING_DIR: &str = "tracing";
 
 /// Base directory name for unnamed testnets passed through the --testnet-dir flag
 pub const CUSTOM_TESTNET_DIR: &str = "custom";
@@ -20,9 +21,9 @@ pub const CUSTOM_TESTNET_DIR: &str = "custom";
 /// if not present, then checks the "testnet-dir" flag and returns a custom name
 /// If neither flags are present, returns the default hardcoded network name.
 pub fn get_network_dir(matches: &ArgMatches) -> String {
-    if let Some(network_name) = matches.value_of("network") {
+    if let Some(network_name) = matches.get_one::<String>("network") {
         network_name.to_string()
-    } else if matches.value_of("testnet-dir").is_some() {
+    } else if matches.get_one::<String>("testnet-dir").is_some() {
         CUSTOM_TESTNET_DIR.to_string()
     } else {
         eth2_network_config::DEFAULT_HARDCODED_NETWORK.to_string()
@@ -38,6 +39,19 @@ pub fn ensure_dir_exists<P: AsRef<Path>>(path: P) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// If `arg` is in `matches`, parses the value as a path.
+///
+/// Otherwise, attempts to find the default directory for the `testnet` from the `matches`.
+pub fn parse_path_or_default(matches: &ArgMatches, arg: &'static str) -> Result<PathBuf, String> {
+    clap_utils::parse_path_with_default_in_home_dir(
+        matches,
+        arg,
+        PathBuf::new()
+            .join(DEFAULT_ROOT_DIR)
+            .join(get_network_dir(matches)),
+    )
 }
 
 /// If `arg` is in `matches`, parses the value as a path.

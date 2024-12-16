@@ -1,51 +1,103 @@
-#![cfg(all(test, not(feature = "fake_crypto")))]
+#![cfg(all(test, not(feature = "fake_crypto"), not(debug_assertions)))]
 
-use super::block_processing_builder::BlockProcessingBuilder;
-use super::errors::*;
-use crate::{per_block_processing, BlockSignatureStrategy};
-use types::test_utils::{
-    AttestationTestTask, AttesterSlashingTestTask, DepositTestTask, ProposerSlashingTestTask,
+use crate::per_block_processing::errors::{
+    AttestationInvalid, AttesterSlashingInvalid, BlockOperationError, BlockProcessingError,
+    DepositInvalid, HeaderInvalid, IndexedAttestationInvalid, IntoWithIndex,
+    ProposerSlashingInvalid,
 };
+use crate::{per_block_processing, BlockReplayError, BlockReplayer};
+use crate::{
+    per_block_processing::{process_operations, verify_exit::verify_exit},
+    BlockSignatureStrategy, ConsensusContext, VerifyBlockRoot, VerifySignatures,
+};
+use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType};
+use ssz_types::Bitfield;
+use std::sync::{Arc, LazyLock};
+use test_utils::generate_deterministic_keypairs;
 use types::*;
 
+pub const MAX_VALIDATOR_COUNT: usize = 97;
 pub const NUM_DEPOSITS: u64 = 1;
 pub const VALIDATOR_COUNT: usize = 64;
 pub const EPOCH_OFFSET: u64 = 4;
 pub const NUM_ATTESTATIONS: u64 = 1;
 
-type E = MainnetEthSpec;
+/// A cached set of keys.
+static KEYPAIRS: LazyLock<Vec<Keypair>> =
+    LazyLock::new(|| generate_deterministic_keypairs(MAX_VALIDATOR_COUNT));
 
-#[test]
-fn valid_block_ok() {
+async fn get_harness<E: EthSpec>(
+    epoch_offset: u64,
+    num_validators: usize,
+) -> BeaconChainHarness<EphemeralHarnessType<E>> {
+    // Set the state and block to be in the last slot of the `epoch_offset`th epoch.
+    let last_slot_of_epoch =
+        (MainnetEthSpec::genesis_epoch() + epoch_offset).end_slot(E::slots_per_epoch());
+    let harness = BeaconChainHarness::<EphemeralHarnessType<E>>::builder(E::default())
+        .default_spec()
+        .keypairs(KEYPAIRS[0..num_validators].to_vec())
+        .fresh_ephemeral_store()
+        .build();
+    let state = harness.get_current_state();
+    if last_slot_of_epoch > Slot::new(0) {
+        harness
+            .add_attested_blocks_at_slots(
+                state,
+                Hash256::zero(),
+                (1..last_slot_of_epoch.as_u64())
+                    .map(Slot::new)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                (0..num_validators).collect::<Vec<_>>().as_slice(),
+            )
+            .await;
+    }
+    harness
+}
+
+#[tokio::test]
+async fn valid_block_ok() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let (block, mut state) = builder.build(None, None);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let state = harness.get_current_state();
 
+    let slot = state.slot();
+    let ((block, _), mut state) = harness
+        .make_block_return_pre_state(state, slot + Slot::new(1))
+        .await;
+
+    let mut ctxt = ConsensusContext::new(block.slot());
     let result = per_block_processing(
         &mut state,
         &block,
-        None,
         BlockSignatureStrategy::VerifyIndividual,
+        VerifyBlockRoot::True,
+        &mut ctxt,
         &spec,
     );
 
-    assert_eq!(result, Ok(()));
+    assert!(result.is_ok());
 }
 
-#[test]
-fn invalid_block_header_state_slot() {
+#[tokio::test]
+async fn invalid_block_header_state_slot() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let (mut block, mut state) = builder.build(None, None);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    state.slot = Slot::new(133_713);
-    block.message.slot = Slot::new(424_242);
+    let state = harness.get_current_state();
+    let slot = state.slot() + Slot::new(1);
 
+    let ((signed_block, _), mut state) = harness.make_block_return_pre_state(state, slot).await;
+    let (mut block, signature) = (*signed_block).clone().deconstruct();
+    *block.slot_mut() = slot + Slot::new(1);
+
+    let mut ctxt = ConsensusContext::new(block.slot());
     let result = per_block_processing(
         &mut state,
-        &block,
-        None,
+        &SignedBeaconBlock::from_block(block, signature),
         BlockSignatureStrategy::VerifyIndividual,
+        VerifyBlockRoot::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -57,18 +109,27 @@ fn invalid_block_header_state_slot() {
     );
 }
 
-#[test]
-fn invalid_parent_block_root() {
+#[tokio::test]
+async fn invalid_parent_block_root() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let invalid_parent_root = Hash256::from([0xAA; 32]);
-    let (block, mut state) = builder.build(None, Some(invalid_parent_root));
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
+    let state = harness.get_current_state();
+    let slot = state.slot();
+
+    let ((signed_block, _), mut state) = harness
+        .make_block_return_pre_state(state, slot + Slot::new(1))
+        .await;
+    let (mut block, signature) = (*signed_block).clone().deconstruct();
+    *block.parent_root_mut() = Hash256::from([0xAA; 32]);
+
+    let mut ctxt = ConsensusContext::new(block.slot());
     let result = per_block_processing(
         &mut state,
-        &block,
-        None,
+        &SignedBeaconBlock::from_block(block, signature),
         BlockSignatureStrategy::VerifyIndividual,
+        VerifyBlockRoot::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -76,34 +137,32 @@ fn invalid_parent_block_root() {
         result,
         Err(BlockProcessingError::HeaderInvalid {
             reason: HeaderInvalid::ParentBlockRootMismatch {
-                state: state.latest_block_header.canonical_root(),
-                block: block.parent_root()
+                state: state.latest_block_header().canonical_root(),
+                block: Hash256::from([0xAA; 32])
             }
         })
     );
 }
 
-#[test]
-fn invalid_block_signature() {
+#[tokio::test]
+async fn invalid_block_signature() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let (block, mut state) = builder.build(None, None);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    // sign the block with a keypair that is not the expected proposer
-    let keypair = Keypair::random();
-    let block = block.message.sign(
-        &keypair.sk,
-        &state.fork,
-        state.genesis_validators_root,
-        &spec,
-    );
+    let state = harness.get_current_state();
+    let slot = state.slot();
+    let ((signed_block, _), mut state) = harness
+        .make_block_return_pre_state(state, slot + Slot::new(1))
+        .await;
+    let (block, _) = (*signed_block).clone().deconstruct();
 
-    // process block with invalid block signature
+    let mut ctxt = ConsensusContext::new(block.slot());
     let result = per_block_processing(
         &mut state,
-        &block,
-        None,
+        &SignedBeaconBlock::from_block(block, Signature::empty()),
         BlockSignatureStrategy::VerifyIndividual,
+        VerifyBlockRoot::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -116,20 +175,27 @@ fn invalid_block_signature() {
     );
 }
 
-#[test]
-fn invalid_randao_reveal_signature() {
+#[tokio::test]
+async fn invalid_randao_reveal_signature() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    // sign randao reveal with random keypair
-    let keypair = Keypair::random();
-    let (block, mut state) = builder.build(Some(keypair.sk), None);
+    let state = harness.get_current_state();
+    let slot = state.slot();
 
+    let ((signed_block, _), mut state) = harness
+        .make_block_with_modifier(state, slot + 1, |block| {
+            *block.body_mut().randao_reveal_mut() = Signature::empty();
+        })
+        .await;
+
+    let mut ctxt = ConsensusContext::new(signed_block.slot());
     let result = per_block_processing(
         &mut state,
-        &block,
-        None,
+        &signed_block,
         BlockSignatureStrategy::VerifyIndividual,
+        VerifyBlockRoot::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -137,45 +203,51 @@ fn invalid_randao_reveal_signature() {
     assert_eq!(result, Err(BlockProcessingError::RandaoSignatureInvalid));
 }
 
-#[test]
-fn valid_4_deposits() {
+#[tokio::test]
+async fn valid_4_deposits() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = DepositTestTask::Valid;
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut state = harness.get_current_state();
 
-    let (block, mut state) = builder.build_with_n_deposits(4, test_task, None, None, &spec);
+    let (deposits, state) = harness.make_deposits(&mut state, 4, None, None);
+    let deposits = VariableList::from(deposits);
 
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
-        &spec,
-    );
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block.to_mut().body_mut().deposits_mut() = deposits;
+
+    let result = process_operations::process_deposits(state, head_block.body().deposits(), &spec);
 
     // Expecting Ok because these are valid deposits.
     assert_eq!(result, Ok(()));
 }
 
-#[test]
-fn invalid_deposit_deposit_count_too_big() {
+#[tokio::test]
+async fn invalid_deposit_deposit_count_too_big() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = DepositTestTask::Valid;
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut state = harness.get_current_state();
 
-    let (block, mut state) =
-        builder.build_with_n_deposits(NUM_DEPOSITS, test_task, None, None, &spec);
+    let (deposits, state) = harness.make_deposits(&mut state, 1, None, None);
+    let deposits = VariableList::from(deposits);
+
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block.to_mut().body_mut().deposits_mut() = deposits;
 
     let big_deposit_count = NUM_DEPOSITS + 1;
-    state.eth1_data.deposit_count = big_deposit_count;
-
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
-        &spec,
-    );
+    state.eth1_data_mut().deposit_count = big_deposit_count;
+    let result = process_operations::process_deposits(state, head_block.body().deposits(), &spec);
 
     // Expecting DepositCountInvalid because we incremented the deposit_count
     assert_eq!(
@@ -187,25 +259,27 @@ fn invalid_deposit_deposit_count_too_big() {
     );
 }
 
-#[test]
-fn invalid_deposit_count_too_small() {
+#[tokio::test]
+async fn invalid_deposit_count_too_small() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = DepositTestTask::Valid;
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut state = harness.get_current_state();
 
-    let (block, mut state) =
-        builder.build_with_n_deposits(NUM_DEPOSITS, test_task, None, None, &spec);
+    let (deposits, state) = harness.make_deposits(&mut state, 1, None, None);
+    let deposits = VariableList::from(deposits);
+
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block.to_mut().body_mut().deposits_mut() = deposits;
 
     let small_deposit_count = NUM_DEPOSITS - 1;
-    state.eth1_data.deposit_count = small_deposit_count;
-
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
-        &spec,
-    );
+    state.eth1_data_mut().deposit_count = small_deposit_count;
+    let result = process_operations::process_deposits(state, head_block.body().deposits(), &spec);
 
     // Expecting DepositCountInvalid because we decremented the deposit_count
     assert_eq!(
@@ -217,27 +291,29 @@ fn invalid_deposit_count_too_small() {
     );
 }
 
-#[test]
-fn invalid_deposit_bad_merkle_proof() {
+#[tokio::test]
+async fn invalid_deposit_bad_merkle_proof() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = DepositTestTask::Valid;
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut state = harness.get_current_state();
 
-    let (block, mut state) =
-        builder.build_with_n_deposits(NUM_DEPOSITS, test_task, None, None, &spec);
+    let (deposits, state) = harness.make_deposits(&mut state, 1, None, None);
+    let deposits = VariableList::from(deposits);
 
-    let bad_index = state.eth1_deposit_index as usize;
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block.to_mut().body_mut().deposits_mut() = deposits;
+    let bad_index = state.eth1_deposit_index() as usize;
 
     // Manually offsetting deposit count and index to trigger bad merkle proof
-    state.eth1_data.deposit_count += 1;
-    state.eth1_deposit_index += 1;
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
-        &spec,
-    );
+    state.eth1_data_mut().deposit_count += 1;
+    *state.eth1_deposit_index_mut() += 1;
+    let result = process_operations::process_deposits(state, head_block.body().deposits(), &spec);
 
     // Expecting BadMerkleProof because the proofs were created with different indices
     assert_eq!(
@@ -249,111 +325,86 @@ fn invalid_deposit_bad_merkle_proof() {
     );
 }
 
-#[test]
-fn invalid_deposit_wrong_pubkey() {
+#[tokio::test]
+async fn invalid_deposit_wrong_sig() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = DepositTestTask::BadPubKey;
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut state = harness.get_current_state();
 
-    let (block, mut state) =
-        builder.build_with_n_deposits(NUM_DEPOSITS, test_task, None, None, &spec);
+    let (deposits, state) =
+        harness.make_deposits(&mut state, 1, None, Some(SignatureBytes::empty()));
+    let deposits = VariableList::from(deposits);
 
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
-        &spec,
-    );
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block.to_mut().body_mut().deposits_mut() = deposits;
 
-    // Expecting Ok(()) even though the public key provided does not correspond to the correct public key
-    assert_eq!(result, Ok(()));
-}
-
-#[test]
-fn invalid_deposit_wrong_sig() {
-    let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = DepositTestTask::BadSig;
-
-    let (block, mut state) =
-        builder.build_with_n_deposits(NUM_DEPOSITS, test_task, None, None, &spec);
-
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
-        &spec,
-    );
-
+    let result = process_operations::process_deposits(state, head_block.body().deposits(), &spec);
     // Expecting Ok(()) even though the block signature does not correspond to the correct public key
     assert_eq!(result, Ok(()));
 }
 
-#[test]
-fn invalid_deposit_invalid_pub_key() {
+#[tokio::test]
+async fn invalid_deposit_invalid_pub_key() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = DepositTestTask::InvalidPubKey;
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut state = harness.get_current_state();
 
-    let (block, mut state) =
-        builder.build_with_n_deposits(NUM_DEPOSITS, test_task, None, None, &spec);
+    let (deposits, state) =
+        harness.make_deposits(&mut state, 1, Some(PublicKeyBytes::empty()), None);
+    let deposits = VariableList::from(deposits);
 
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
-        &spec,
-    );
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block.to_mut().body_mut().deposits_mut() = deposits;
+
+    let result = process_operations::process_deposits(state, head_block.body().deposits(), &spec);
 
     // Expecting Ok(()) even though we passed in invalid publickeybytes in the public key field of the deposit data.
     assert_eq!(result, Ok(()));
 }
 
-#[test]
-fn valid_attestations() {
+#[tokio::test]
+async fn invalid_attestation_no_committee_for_index() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttestationTestTask::Valid;
-    let (block, mut state) =
-        builder.build_with_n_attestations(test_task, NUM_ATTESTATIONS, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut state = harness.get_current_state();
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    head_block
+        .to_mut()
+        .body_mut()
+        .attestations_mut()
+        .next()
+        .unwrap()
+        .data_mut()
+        .index += 1;
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attestations(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        head_block.body(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
-    // Expecting Ok(()) because these are valid attestations
-    assert_eq!(result, Ok(()));
-}
-
-#[test]
-fn invalid_attestation_no_committee_for_index() {
-    let spec = MainnetEthSpec::default_spec();
-    let slot = Epoch::new(EPOCH_OFFSET).start_slot(E::slots_per_epoch());
-    let builder =
-        get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT).insert_attestation(slot, 0, |_, _| true);
-    let committee_index = builder.state.get_committee_count_at_slot(slot).unwrap();
-    let (block, mut state) = builder
-        .modify(|block| {
-            block.body.attestations[0].data.index = committee_index;
-        })
-        .build(None, None);
-
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
-        &spec,
-    );
-
-    // Expecting NoCommitee because we manually set the attestation's index to be invalid
+    // Expecting NoCommittee because we manually set the attestation's index to be invalid
     assert_eq!(
         result,
         Err(BlockProcessingError::AttestationInvalid {
@@ -363,19 +414,43 @@ fn invalid_attestation_no_committee_for_index() {
     );
 }
 
-#[test]
-fn invalid_attestation_wrong_justified_checkpoint() {
+#[tokio::test]
+async fn invalid_attestation_wrong_justified_checkpoint() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttestationTestTask::WrongJustifiedCheckpoint;
-    let (block, mut state) =
-        builder.build_with_n_attestations(test_task, NUM_ATTESTATIONS, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut state = harness.get_current_state();
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    let old_justified_checkpoint = head_block
+        .body()
+        .attestations()
+        .next()
+        .unwrap()
+        .data()
+        .source;
+    let mut new_justified_checkpoint = old_justified_checkpoint;
+    new_justified_checkpoint.epoch += Epoch::new(1);
+    head_block
+        .to_mut()
+        .body_mut()
+        .attestations_mut()
+        .next()
+        .unwrap()
+        .data_mut()
+        .source = new_justified_checkpoint;
+
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attestations(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        head_block.body(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -386,65 +461,46 @@ fn invalid_attestation_wrong_justified_checkpoint() {
         Err(BlockProcessingError::AttestationInvalid {
             index: 0,
             reason: AttestationInvalid::WrongJustifiedCheckpoint {
-                state: Checkpoint {
-                    epoch: Epoch::from(2_u64),
-                    root: Hash256::zero(),
-                },
-                attestation: Checkpoint {
-                    epoch: Epoch::from(0_u64),
-                    root: Hash256::zero(),
-                },
+                state: Box::new(old_justified_checkpoint),
+                attestation: Box::new(new_justified_checkpoint),
                 is_current: true,
             }
         })
     );
 }
 
-#[test]
-fn invalid_attestation_bad_indexed_attestation_bad_signature() {
+#[tokio::test]
+async fn invalid_attestation_bad_aggregation_bitfield_len() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttestationTestTask::BadIndexedAttestationBadSignature;
-    let (block, mut state) =
-        builder.build_with_n_attestations(test_task, NUM_ATTESTATIONS, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut state = harness.get_current_state();
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block
+        .to_mut()
+        .body_mut()
+        .attestations_mut()
+        .next()
+        .unwrap()
+        .aggregation_bits_base_mut()
+        .unwrap() = Bitfield::with_capacity(spec.target_committee_size).unwrap();
+
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attestations(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        head_block.body(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
-    // Expecting BadIndexedAttestation(BadSignature) because we ommitted the aggregation bits in the attestation
-    assert_eq!(
-        result,
-        Err(BlockProcessingError::AttestationInvalid {
-            index: 0,
-            reason: AttestationInvalid::BadIndexedAttestation(
-                IndexedAttestationInvalid::BadSignature
-            )
-        })
-    );
-}
-
-#[test]
-fn invalid_attestation_bad_aggregation_bitfield_len() {
-    let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttestationTestTask::BadAggregationBitfieldLen;
-    let (block, mut state) =
-        builder.build_with_n_attestations(test_task, NUM_ATTESTATIONS, None, None, &spec);
-
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
-        &spec,
-    );
-
-    // Expecting InvalidBitfield because the size of the aggregation_bitfield is bigger than the commitee size.
+    // Expecting InvalidBitfield because the size of the aggregation_bitfield is bigger than the committee size.
     assert_eq!(
         result,
         Err(BlockProcessingError::BeaconStateError(
@@ -453,21 +509,35 @@ fn invalid_attestation_bad_aggregation_bitfield_len() {
     );
 }
 
-#[test]
-fn invalid_attestation_bad_signature() {
+#[tokio::test]
+async fn invalid_attestation_bad_signature() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, 97); // minimal number of required validators for this test
-    let test_task = AttestationTestTask::BadSignature;
-    let (block, mut state) =
-        builder.build_with_n_attestations(test_task, NUM_ATTESTATIONS, None, None, &spec);
-    let result = per_block_processing(
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, 97).await; // minimal number of required validators for this test
+
+    let mut state = harness.get_current_state();
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block
+        .to_mut()
+        .body_mut()
+        .attestations_mut()
+        .next()
+        .unwrap()
+        .signature_mut() = AggregateSignature::empty();
+
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attestations(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        head_block.body(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
-
     // Expecting BadSignature because we're signing with invalid secret_keys
     assert_eq!(
         result,
@@ -480,19 +550,36 @@ fn invalid_attestation_bad_signature() {
     );
 }
 
-#[test]
-fn invalid_attestation_included_too_early() {
+#[tokio::test]
+async fn invalid_attestation_included_too_early() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttestationTestTask::IncludedTooEarly;
-    let (block, mut state) =
-        builder.build_with_n_attestations(test_task, NUM_ATTESTATIONS, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut state = harness.get_current_state();
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    let new_attesation_slot = head_block.body().attestations().next().unwrap().data().slot
+        + Slot::new(MainnetEthSpec::slots_per_epoch());
+    head_block
+        .to_mut()
+        .body_mut()
+        .attestations_mut()
+        .next()
+        .unwrap()
+        .data_mut()
+        .slot = new_attesation_slot;
+
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attestations(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        head_block.body(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -502,87 +589,117 @@ fn invalid_attestation_included_too_early() {
         Err(BlockProcessingError::AttestationInvalid {
             index: 0,
             reason: AttestationInvalid::IncludedTooEarly {
-                state: state.slot,
+                state: state.slot(),
                 delay: spec.min_attestation_inclusion_delay,
-                attestation: block.message.body.attestations[0].data.slot,
+                attestation: new_attesation_slot,
             }
         })
     );
 }
 
-#[test]
-fn invalid_attestation_included_too_late() {
+#[tokio::test]
+async fn invalid_attestation_included_too_late() {
     let spec = MainnetEthSpec::default_spec();
     // note to maintainer: might need to increase validator count if we get NoCommittee
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttestationTestTask::IncludedTooLate;
-    let (block, mut state) =
-        builder.build_with_n_attestations(test_task, NUM_ATTESTATIONS, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut state = harness.get_current_state();
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    let new_attesation_slot = head_block.body().attestations().next().unwrap().data().slot
+        - Slot::new(MainnetEthSpec::slots_per_epoch());
+    head_block
+        .to_mut()
+        .body_mut()
+        .attestations_mut()
+        .next()
+        .unwrap()
+        .data_mut()
+        .slot = new_attesation_slot;
+
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attestations(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        head_block.body(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
-
     assert_eq!(
         result,
         Err(BlockProcessingError::AttestationInvalid {
             index: 0,
             reason: AttestationInvalid::IncludedTooLate {
-                state: state.slot,
-                attestation: block.message.body.attestations[0].data.slot,
+                state: state.slot(),
+                attestation: new_attesation_slot,
             }
         })
     );
 }
 
-#[test]
-fn invalid_attestation_target_epoch_slot_mismatch() {
+#[tokio::test]
+async fn invalid_attestation_target_epoch_slot_mismatch() {
     let spec = MainnetEthSpec::default_spec();
     // note to maintainer: might need to increase validator count if we get NoCommittee
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttestationTestTask::TargetEpochSlotMismatch;
-    let (block, mut state) =
-        builder.build_with_n_attestations(test_task, NUM_ATTESTATIONS, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut state = harness.get_current_state();
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    head_block
+        .to_mut()
+        .body_mut()
+        .attestations_mut()
+        .next()
+        .unwrap()
+        .data_mut()
+        .target
+        .epoch += Epoch::new(1);
+
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attestations(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        head_block.body(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
-
-    let attestation = &block.message.body.attestations[0].data;
     assert_eq!(
         result,
         Err(BlockProcessingError::AttestationInvalid {
             index: 0,
             reason: AttestationInvalid::TargetEpochSlotMismatch {
-                target_epoch: attestation.target.epoch,
-                slot_epoch: attestation.slot.epoch(E::slots_per_epoch()),
+                target_epoch: Epoch::new(EPOCH_OFFSET + 1),
+                slot_epoch: Epoch::new(EPOCH_OFFSET),
             }
         })
     );
 }
 
-#[test]
-fn valid_insert_attester_slashing() {
+#[tokio::test]
+async fn valid_insert_attester_slashing() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttesterSlashingTestTask::Valid;
-    let num_attester_slashings = 1;
-    let (block, mut state) =
-        builder.build_with_attester_slashing(test_task, num_attester_slashings, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let attester_slashing = harness.make_attester_slashing(vec![1, 2]);
+
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attester_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        [attester_slashing.to_ref()].into_iter(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -590,19 +707,28 @@ fn valid_insert_attester_slashing() {
     assert_eq!(result, Ok(()));
 }
 
-#[test]
-fn invalid_attester_slashing_not_slashable() {
+#[tokio::test]
+async fn invalid_attester_slashing_not_slashable() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttesterSlashingTestTask::NotSlashable;
-    let num_attester_slashings = 1;
-    let (block, mut state) =
-        builder.build_with_attester_slashing(test_task, num_attester_slashings, None, None, &spec);
-    let result = per_block_processing(
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+
+    let mut attester_slashing = harness.make_attester_slashing(vec![1, 2]);
+    match &mut attester_slashing {
+        AttesterSlashing::Base(ref mut attester_slashing) => {
+            attester_slashing.attestation_1 = attester_slashing.attestation_2.clone();
+        }
+        AttesterSlashing::Electra(ref mut attester_slashing) => {
+            attester_slashing.attestation_1 = attester_slashing.attestation_2.clone();
+        }
+    }
+
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attester_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        [attester_slashing.to_ref()].into_iter(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -616,20 +742,28 @@ fn invalid_attester_slashing_not_slashable() {
     );
 }
 
-#[test]
-fn invalid_attester_slashing_1_invalid() {
+#[tokio::test]
+async fn invalid_attester_slashing_1_invalid() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttesterSlashingTestTask::IndexedAttestation1Invalid;
-    let num_attester_slashings = 1;
-    let (block, mut state) =
-        builder.build_with_attester_slashing(test_task, num_attester_slashings, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut attester_slashing = harness.make_attester_slashing(vec![1, 2]);
+    match &mut attester_slashing {
+        AttesterSlashing::Base(ref mut attester_slashing) => {
+            attester_slashing.attestation_1.attesting_indices = VariableList::from(vec![2, 1]);
+        }
+        AttesterSlashing::Electra(ref mut attester_slashing) => {
+            attester_slashing.attestation_1.attesting_indices = VariableList::from(vec![2, 1]);
+        }
+    }
+
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attester_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        [attester_slashing.to_ref()].into_iter(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -646,20 +780,28 @@ fn invalid_attester_slashing_1_invalid() {
     );
 }
 
-#[test]
-fn invalid_attester_slashing_2_invalid() {
+#[tokio::test]
+async fn invalid_attester_slashing_2_invalid() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = AttesterSlashingTestTask::IndexedAttestation2Invalid;
-    let num_attester_slashings = 1;
-    let (block, mut state) =
-        builder.build_with_attester_slashing(test_task, num_attester_slashings, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut attester_slashing = harness.make_attester_slashing(vec![1, 2]);
+    match &mut attester_slashing {
+        AttesterSlashing::Base(ref mut attester_slashing) => {
+            attester_slashing.attestation_2.attesting_indices = VariableList::from(vec![2, 1]);
+        }
+        AttesterSlashing::Electra(ref mut attester_slashing) => {
+            attester_slashing.attestation_2.attesting_indices = VariableList::from(vec![2, 1]);
+        }
+    }
+
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_attester_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        [attester_slashing.to_ref()].into_iter(),
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -676,39 +818,42 @@ fn invalid_attester_slashing_2_invalid() {
     );
 }
 
-#[test]
-fn valid_insert_proposer_slashing() {
+#[tokio::test]
+async fn valid_insert_proposer_slashing() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = ProposerSlashingTestTask::Valid;
-    let (block, mut state) = builder.build_with_proposer_slashing(test_task, 1, None, None, &spec);
-
-    let result = per_block_processing(
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let proposer_slashing = harness.make_proposer_slashing(1);
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_proposer_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        &[proposer_slashing],
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
-
-    // Expecting Ok(()) because we inserted a valid proposer slashing
-    assert_eq!(result, Ok(()));
+    // Expecting Ok(_) because we inserted a valid proposer slashing
+    assert!(result.is_ok());
 }
 
-#[test]
-fn invalid_proposer_slashing_proposals_identical() {
+#[tokio::test]
+async fn invalid_proposer_slashing_proposals_identical() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = ProposerSlashingTestTask::ProposalsIdentical;
-    let (block, mut state) = builder.build_with_proposer_slashing(test_task, 1, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut proposer_slashing = harness.make_proposer_slashing(1);
+    proposer_slashing.signed_header_1.message = proposer_slashing.signed_header_2.message.clone();
+
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_proposer_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        &[proposer_slashing],
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
+
     // Expecting ProposalsIdentical because we the two headers are identical
     assert_eq!(
         result,
@@ -719,18 +864,22 @@ fn invalid_proposer_slashing_proposals_identical() {
     );
 }
 
-#[test]
-fn invalid_proposer_slashing_proposer_unknown() {
+#[tokio::test]
+async fn invalid_proposer_slashing_proposer_unknown() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = ProposerSlashingTestTask::ProposerUnknown;
-    let (block, mut state) = builder.build_with_proposer_slashing(test_task, 1, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    let result = per_block_processing(
+    let mut proposer_slashing = harness.make_proposer_slashing(1);
+    proposer_slashing.signed_header_1.message.proposer_index = 3_141_592;
+    proposer_slashing.signed_header_2.message.proposer_index = 3_141_592;
+
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_proposer_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        &[proposer_slashing],
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -744,80 +893,53 @@ fn invalid_proposer_slashing_proposer_unknown() {
     );
 }
 
-#[test]
-fn invalid_proposer_slashing_not_slashable() {
+#[tokio::test]
+async fn invalid_proposer_slashing_duplicate_slashing() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = ProposerSlashingTestTask::ProposerNotSlashable;
-    let (block, mut state) = builder.build_with_proposer_slashing(test_task, 1, None, None, &spec);
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
 
-    state.validators[0].slashed = true;
-    let result = per_block_processing(
+    let proposer_slashing = harness.make_proposer_slashing(1);
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result_1 = process_operations::process_proposer_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        &[proposer_slashing.clone()],
+        VerifySignatures::False,
+        &mut ctxt,
         &spec,
     );
+    assert!(result_1.is_ok());
 
+    let result_2 = process_operations::process_proposer_slashings(
+        &mut state,
+        &[proposer_slashing],
+        VerifySignatures::False,
+        &mut ctxt,
+        &spec,
+    );
     // Expecting ProposerNotSlashable because we've already slashed the validator
     assert_eq!(
-        result,
+        result_2,
         Err(BlockProcessingError::ProposerSlashingInvalid {
             index: 0,
-            reason: ProposerSlashingInvalid::ProposerNotSlashable(0)
+            reason: ProposerSlashingInvalid::ProposerNotSlashable(1)
         })
     );
 }
 
-#[test]
-fn invalid_proposer_slashing_duplicate_slashing() {
+#[tokio::test]
+async fn invalid_bad_proposal_1_signature() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = ProposerSlashingTestTask::Valid;
-    let (mut block, mut state) =
-        builder.build_with_proposer_slashing(test_task, 1, None, None, &spec);
-
-    let slashing = block.message.body.proposer_slashings[0].clone();
-    let slashed_proposer = slashing.signed_header_1.message.proposer_index;
-    block
-        .message
-        .body
-        .proposer_slashings
-        .push(slashing)
-        .expect("should push slashing");
-
-    let result = per_block_processing(
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut proposer_slashing = harness.make_proposer_slashing(1);
+    proposer_slashing.signed_header_1.signature = Signature::empty();
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_proposer_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::NoVerification,
-        &spec,
-    );
-
-    // Expecting ProposerNotSlashable for the 2nd slashing because the validator has been
-    // slashed by the 1st slashing.
-    assert_eq!(
-        result,
-        Err(BlockProcessingError::ProposerSlashingInvalid {
-            index: 1,
-            reason: ProposerSlashingInvalid::ProposerNotSlashable(slashed_proposer)
-        })
-    );
-}
-
-#[test]
-fn invalid_bad_proposal_1_signature() {
-    let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = ProposerSlashingTestTask::BadProposal1Signature;
-    let (block, mut state) = builder.build_with_proposer_slashing(test_task, 1, None, None, &spec);
-
-    let result = per_block_processing(
-        &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        &[proposer_slashing],
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -831,18 +953,19 @@ fn invalid_bad_proposal_1_signature() {
     );
 }
 
-#[test]
-fn invalid_bad_proposal_2_signature() {
+#[tokio::test]
+async fn invalid_bad_proposal_2_signature() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = ProposerSlashingTestTask::BadProposal2Signature;
-    let (block, mut state) = builder.build_with_proposer_slashing(test_task, 1, None, None, &spec);
-
-    let result = per_block_processing(
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut proposer_slashing = harness.make_proposer_slashing(1);
+    proposer_slashing.signed_header_2.signature = Signature::empty();
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_proposer_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        &[proposer_slashing],
+        VerifySignatures::True,
+        &mut ctxt,
         &spec,
     );
 
@@ -856,18 +979,20 @@ fn invalid_bad_proposal_2_signature() {
     );
 }
 
-#[test]
-fn invalid_proposer_slashing_proposal_epoch_mismatch() {
+#[tokio::test]
+async fn invalid_proposer_slashing_proposal_epoch_mismatch() {
     let spec = MainnetEthSpec::default_spec();
-    let builder = get_builder(&spec, EPOCH_OFFSET, VALIDATOR_COUNT);
-    let test_task = ProposerSlashingTestTask::ProposalEpochMismatch;
-    let (block, mut state) = builder.build_with_proposer_slashing(test_task, 1, None, None, &spec);
-
-    let result = per_block_processing(
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut proposer_slashing = harness.make_proposer_slashing(1);
+    proposer_slashing.signed_header_1.message.slot = Slot::new(0);
+    proposer_slashing.signed_header_2.message.slot = Slot::new(128);
+    let mut state = harness.get_current_state();
+    let mut ctxt = ConsensusContext::new(state.slot());
+    let result = process_operations::process_proposer_slashings(
         &mut state,
-        &block,
-        None,
-        BlockSignatureStrategy::VerifyIndividual,
+        &[proposer_slashing],
+        VerifySignatures::False,
+        &mut ctxt,
         &spec,
     );
 
@@ -884,13 +1009,136 @@ fn invalid_proposer_slashing_proposal_epoch_mismatch() {
     );
 }
 
-fn get_builder(
-    spec: &ChainSpec,
-    epoch_offset: u64,
-    num_validators: usize,
-) -> BlockProcessingBuilder<MainnetEthSpec> {
-    // Set the state and block to be in the last slot of the `epoch_offset`th epoch.
-    let last_slot_of_epoch = (MainnetEthSpec::genesis_epoch() + epoch_offset)
-        .end_slot(MainnetEthSpec::slots_per_epoch());
-    BlockProcessingBuilder::new(num_validators, last_slot_of_epoch, &spec).build_caches()
+#[tokio::test]
+async fn fork_spanning_exit() {
+    let mut spec = MainnetEthSpec::default_spec();
+    let slots_per_epoch = MainnetEthSpec::slots_per_epoch();
+
+    spec.altair_fork_epoch = Some(Epoch::new(2));
+    spec.bellatrix_fork_epoch = Some(Epoch::new(4));
+    spec.shard_committee_period = 0;
+    let spec = Arc::new(spec);
+
+    let harness = BeaconChainHarness::builder(MainnetEthSpec)
+        .spec(spec.clone())
+        .deterministic_keypairs(VALIDATOR_COUNT)
+        .mock_execution_layer()
+        .fresh_ephemeral_store()
+        .build();
+
+    harness.extend_to_slot(slots_per_epoch.into()).await;
+
+    /*
+     * Produce an exit *before* Altair.
+     */
+
+    let signed_exit = harness.make_voluntary_exit(0, Epoch::new(1));
+    assert!(signed_exit.message.epoch < spec.altair_fork_epoch.unwrap());
+
+    /*
+     * Ensure the exit verifies before Altair.
+     */
+
+    let head = harness.chain.canonical_head.cached_head();
+    let head_state = &head.snapshot.beacon_state;
+    assert!(head_state.current_epoch() < spec.altair_fork_epoch.unwrap());
+    verify_exit(
+        head_state,
+        None,
+        &signed_exit,
+        VerifySignatures::True,
+        &spec,
+    )
+    .expect("phase0 exit verifies against phase0 state");
+
+    /*
+     * Ensure the exit verifies after Altair.
+     */
+
+    harness
+        .extend_to_slot(spec.altair_fork_epoch.unwrap().start_slot(slots_per_epoch))
+        .await;
+    let head = harness.chain.canonical_head.cached_head();
+    let head_state = &head.snapshot.beacon_state;
+    assert!(head_state.current_epoch() >= spec.altair_fork_epoch.unwrap());
+    assert!(head_state.current_epoch() < spec.bellatrix_fork_epoch.unwrap());
+    verify_exit(
+        head_state,
+        None,
+        &signed_exit,
+        VerifySignatures::True,
+        &spec,
+    )
+    .expect("phase0 exit verifies against altair state");
+
+    /*
+     * Ensure the exit no longer verifies after Bellatrix.
+     */
+
+    harness
+        .extend_to_slot(
+            spec.bellatrix_fork_epoch
+                .unwrap()
+                .start_slot(slots_per_epoch),
+        )
+        .await;
+    let head = harness.chain.canonical_head.cached_head();
+    let head_state = &head.snapshot.beacon_state;
+    assert!(head_state.current_epoch() >= spec.bellatrix_fork_epoch.unwrap());
+    verify_exit(
+        head_state,
+        None,
+        &signed_exit,
+        VerifySignatures::True,
+        &spec,
+    )
+    .expect_err("phase0 exit does not verify against bellatrix state");
+}
+
+/// Check that the block replayer does not consume state roots unnecessarily.
+#[tokio::test]
+async fn block_replayer_peeking_state_roots() {
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+
+    let target_state = harness.get_current_state();
+    let target_block_root = harness.head_block_root();
+    let target_block = harness
+        .chain
+        .get_blinded_block(&target_block_root)
+        .unwrap()
+        .unwrap();
+
+    let parent_block_root = target_block.parent_root();
+    let parent_block = harness
+        .chain
+        .get_blinded_block(&parent_block_root)
+        .unwrap()
+        .unwrap();
+    let parent_state = harness
+        .chain
+        .get_state(&parent_block.state_root(), Some(parent_block.slot()))
+        .unwrap()
+        .unwrap();
+
+    // Omit the state root for `target_state` but provide a dummy state root at the *next* slot.
+    // If the block replayer is peeking at the state roots rather than consuming them, then the
+    // dummy state should still be there after block replay completes.
+    let dummy_state_root = Hash256::repeat_byte(0xff);
+    let dummy_slot = target_state.slot() + 1;
+    let state_root_iter = vec![Ok::<_, BlockReplayError>((dummy_state_root, dummy_slot))];
+    let block_replayer = BlockReplayer::new(parent_state, &harness.chain.spec)
+        .state_root_iter(state_root_iter.into_iter())
+        .no_signature_verification()
+        .apply_blocks(vec![target_block], None)
+        .unwrap();
+
+    assert_eq!(
+        block_replayer
+            .state_root_iter
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap(),
+        (dummy_state_root, dummy_slot)
+    );
 }

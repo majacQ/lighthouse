@@ -2,11 +2,16 @@
 name = "state_transition_vectors"
 version = "0.1.0"
 authors = ["Paul Hauner <paul@paulhauner.com>"]
-edition = "2018"
+edition = { workspace = true }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-state_processing = { path = "../../consensus/state_processing" }
-types = { path = "../../consensus/types" }
-eth2_ssz = "0.1.2"
+state_processing = { workspace = true }
+types = { workspace = true }
+ethereum_ssz = { workspace = true }
+beacon_chain = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+portable = ["beacon_chain/portable"]

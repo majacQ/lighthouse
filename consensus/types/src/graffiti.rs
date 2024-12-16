@@ -7,14 +7,14 @@ use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 use ssz::{Decode, DecodeError, Encode};
 use std::fmt;
 use std::str::FromStr;
-use tree_hash::TreeHash;
+use tree_hash::{PackedEncoding, TreeHash};
 
 pub const GRAFFITI_BYTES_LEN: usize = 32;
 
 /// The 32-byte `graffiti` field on a beacon block.
-#[derive(Default, Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[derive(Default, Debug, PartialEq, Hash, Clone, Copy, Serialize, Deserialize)]
 #[serde(transparent)]
-#[cfg_attr(feature = "arbitrary-fuzz", derive(arbitrary::Arbitrary))]
+#[derive(arbitrary::Arbitrary)]
 pub struct Graffiti(#[serde(with = "serde_graffiti")] pub [u8; GRAFFITI_BYTES_LEN]);
 
 impl Graffiti {
@@ -27,7 +27,7 @@ impl Graffiti {
 
 impl fmt::Display for Graffiti {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", serde_utils::hex::encode(&self.0))
+        write!(f, "{}", serde_utils::hex::encode(self.0))
     }
 }
 
@@ -37,15 +37,21 @@ impl From<[u8; GRAFFITI_BYTES_LEN]> for Graffiti {
     }
 }
 
-impl Into<[u8; GRAFFITI_BYTES_LEN]> for Graffiti {
-    fn into(self) -> [u8; GRAFFITI_BYTES_LEN] {
-        self.0
+impl From<Graffiti> for [u8; GRAFFITI_BYTES_LEN] {
+    fn from(from: Graffiti) -> [u8; GRAFFITI_BYTES_LEN] {
+        from.0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
 #[serde(transparent)]
 pub struct GraffitiString(String);
+
+impl GraffitiString {
+    pub fn empty() -> Self {
+        Self(String::new())
+    }
+}
 
 impl FromStr for GraffitiString {
     type Err = String;
@@ -71,17 +77,24 @@ impl<'de> Deserialize<'de> for GraffitiString {
     }
 }
 
-impl Into<Graffiti> for GraffitiString {
-    fn into(self) -> Graffiti {
-        let graffiti_bytes = self.0.as_bytes();
-        let mut graffiti = [0; 32];
+impl From<GraffitiString> for Graffiti {
+    fn from(from: GraffitiString) -> Graffiti {
+        let graffiti_bytes = from.0.as_bytes();
+        let mut graffiti = [0; GRAFFITI_BYTES_LEN];
 
-        let graffiti_len = std::cmp::min(graffiti_bytes.len(), 32);
+        let graffiti_len = std::cmp::min(graffiti_bytes.len(), GRAFFITI_BYTES_LEN);
 
         // Copy the provided bytes over.
         //
         // Panic-free because `graffiti_bytes.len()` <= `GRAFFITI_BYTES_LEN`.
-        graffiti[..graffiti_len].copy_from_slice(&graffiti_bytes);
+        graffiti
+            .get_mut(..graffiti_len)
+            .expect("graffiti_len <= GRAFFITI_BYTES_LEN")
+            .copy_from_slice(
+                graffiti_bytes
+                    .get(..graffiti_len)
+                    .expect("graffiti_len <= GRAFFITI_BYTES_LEN"),
+            );
         graffiti.into()
     }
 }
@@ -156,7 +169,7 @@ impl TreeHash for Graffiti {
         <[u8; GRAFFITI_BYTES_LEN]>::tree_hash_type()
     }
 
-    fn tree_hash_packed_encoding(&self) -> Vec<u8> {
+    fn tree_hash_packed_encoding(&self) -> PackedEncoding {
         self.0.tree_hash_packed_encoding()
     }
 
@@ -171,6 +184,6 @@ impl TreeHash for Graffiti {
 
 impl TestRandom for Graffiti {
     fn random_for_test(rng: &mut impl RngCore) -> Self {
-        Self::from(Hash256::random_for_test(rng).to_fixed_bytes())
+        Self::from(Hash256::random_for_test(rng).0)
     }
 }

@@ -1,7 +1,7 @@
 use super::Hash256;
 use crate::test_utils::TestRandom;
 
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use test_random_derive::TestRandom;
 use tree_hash_derive::TreeHash;
@@ -9,8 +9,8 @@ use tree_hash_derive::TreeHash;
 /// Contains data obtained from the Eth1 chain.
 ///
 /// Spec v0.12.1
-#[cfg_attr(feature = "arbitrary-fuzz", derive(arbitrary::Arbitrary))]
 #[derive(
+    arbitrary::Arbitrary,
     Debug,
     PartialEq,
     Clone,

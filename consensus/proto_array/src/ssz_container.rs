@@ -1,20 +1,32 @@
+use crate::proto_array::ProposerBoost;
 use crate::{
-    proto_array::{ProtoArray, ProtoNode},
+    proto_array::{ProtoArray, ProtoNodeV17},
     proto_array_fork_choice::{ElasticList, ProtoArrayForkChoice, VoteTracker},
+    Error, JustifiedBalances,
 };
+use ssz::{four_byte_option_impl, Encode};
 use ssz_derive::{Decode, Encode};
 use std::collections::HashMap;
-use types::{Epoch, Hash256};
+use superstruct::superstruct;
+use types::{Checkpoint, Hash256};
 
-#[derive(Encode, Decode)]
+// Define a "legacy" implementation of `Option<usize>` which uses four bytes for encoding the union
+// selector.
+four_byte_option_impl!(four_byte_option_checkpoint, Checkpoint);
+
+pub type SszContainer = SszContainerV17;
+
+#[superstruct(variants(V17), variant_attributes(derive(Encode, Decode)), no_enum)]
 pub struct SszContainer {
-    votes: Vec<VoteTracker>,
-    balances: Vec<u64>,
-    prune_threshold: usize,
-    justified_epoch: Epoch,
-    finalized_epoch: Epoch,
-    nodes: Vec<ProtoNode>,
-    indices: Vec<(Hash256, usize)>,
+    pub votes: Vec<VoteTracker>,
+    pub balances: Vec<u64>,
+    pub prune_threshold: usize,
+    pub justified_checkpoint: Checkpoint,
+    pub finalized_checkpoint: Checkpoint,
+    #[superstruct(only(V17))]
+    pub nodes: Vec<ProtoNodeV17>,
+    pub indices: Vec<(Hash256, usize)>,
+    pub previous_proposer_boost: ProposerBoost,
 }
 
 impl From<&ProtoArrayForkChoice> for SszContainer {
@@ -23,30 +35,34 @@ impl From<&ProtoArrayForkChoice> for SszContainer {
 
         Self {
             votes: from.votes.0.clone(),
-            balances: from.balances.clone(),
+            balances: from.balances.effective_balances.clone(),
             prune_threshold: proto_array.prune_threshold,
-            justified_epoch: proto_array.justified_epoch,
-            finalized_epoch: proto_array.finalized_epoch,
+            justified_checkpoint: proto_array.justified_checkpoint,
+            finalized_checkpoint: proto_array.finalized_checkpoint,
             nodes: proto_array.nodes.clone(),
             indices: proto_array.indices.iter().map(|(k, v)| (*k, *v)).collect(),
+            previous_proposer_boost: proto_array.previous_proposer_boost,
         }
     }
 }
 
-impl From<SszContainer> for ProtoArrayForkChoice {
-    fn from(from: SszContainer) -> Self {
+impl TryFrom<SszContainer> for ProtoArrayForkChoice {
+    type Error = Error;
+
+    fn try_from(from: SszContainer) -> Result<Self, Error> {
         let proto_array = ProtoArray {
             prune_threshold: from.prune_threshold,
-            justified_epoch: from.justified_epoch,
-            finalized_epoch: from.finalized_epoch,
+            justified_checkpoint: from.justified_checkpoint,
+            finalized_checkpoint: from.finalized_checkpoint,
             nodes: from.nodes,
             indices: from.indices.into_iter().collect::<HashMap<_, _>>(),
+            previous_proposer_boost: from.previous_proposer_boost,
         };
 
-        Self {
+        Ok(Self {
             proto_array,
             votes: ElasticList(from.votes),
-            balances: from.balances,
-        }
+            balances: JustifiedBalances::from_effective_balances(from.balances)?,
+        })
     }
 }

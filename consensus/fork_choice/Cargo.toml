@@ -2,20 +2,20 @@
 name = "fork_choice"
 version = "0.1.0"
 authors = ["Paul Hauner <paul@paulhauner.com>"]
-edition = "2018"
+edition = { workspace = true }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-types = { path = "../types" }
-proto_array = { path = "../proto_array" }
-eth2_ssz = "0.1.2"
-eth2_ssz_derive = "0.1.0"
+types = { workspace = true }
+state_processing = { workspace = true }
+proto_array = { workspace = true }
+ethereum_ssz = { workspace = true }
+ethereum_ssz_derive = { workspace = true }
+metrics = { workspace = true }
+slog = { workspace = true }
 
 [dev-dependencies]
-state_processing = { path = "../../consensus/state_processing" }
-beacon_chain = { path = "../../beacon_node/beacon_chain" }
-store = { path = "../../beacon_node/store" }
-tree_hash = "0.1.1"
-slot_clock = { path = "../../common/slot_clock" }
-hex = "0.4.2"
+beacon_chain = { workspace = true }
+store = { workspace = true }
+tokio = { workspace = true }

@@ -2,7 +2,6 @@ use crate::{lamport_secret_key::LamportSecretKey, secret_bytes::SecretBytes, Zer
 use num_bigint_dig::BigUint;
 use ring::hkdf::{KeyType, Prk, Salt, HKDF_SHA256};
 use sha2::{Digest, Sha256};
-use std::convert::TryFrom;
 use zeroize::Zeroize;
 
 /// The byte size of a SHA256 hash.
@@ -127,7 +126,7 @@ fn mod_r(bytes: &[u8]) -> ZeroizeHash {
     debug_assert!(x_slice.len() <= HASH_SIZE);
 
     let mut output = ZeroizeHash::zero();
-    output.as_mut_bytes()[HASH_SIZE - x_slice.len()..].copy_from_slice(&x_slice);
+    output.as_mut_bytes()[HASH_SIZE - x_slice.len()..].copy_from_slice(x_slice);
     output
 }
 
@@ -148,8 +147,7 @@ fn parent_sk_to_lamport_pk(ikm: &[u8], index: u32) -> ZeroizeHash {
 
     lamports
         .iter()
-        .map(LamportSecretKey::iter_chunks)
-        .flatten()
+        .flat_map(LamportSecretKey::iter_chunks)
         .enumerate()
         .for_each(|(i, chunk)| {
             let mut hasher = Sha256::new();

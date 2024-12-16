@@ -1,11 +1,11 @@
-pub use crate::{common::genesis_deposits, interop::interop_genesis_state};
+pub use crate::common::genesis_deposits;
 pub use eth1::Config as Eth1Config;
 
 use eth1::{DepositLog, Eth1Block, Service as Eth1Service};
 use slog::{debug, error, info, trace, Logger};
 use state_processing::{
     eth2_genesis_time, initialize_beacon_state_from_eth1, is_valid_genesis_state,
-    per_block_processing::process_deposit, process_activations,
+    per_block_processing::process_operations::apply_deposit, process_activations,
 };
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::time::sleep;
-use types::{BeaconState, ChainSpec, Deposit, Eth1Data, EthSpec, Hash256};
+use types::{BeaconState, ChainSpec, Deposit, Eth1Data, EthSpec, FixedBytesExtended, Hash256};
 
 /// The number of blocks that are pulled per request whilst waiting for genesis.
 const BLOCKS_PER_GENESIS_POLL: usize = 99;
@@ -43,7 +43,7 @@ impl Eth1GenesisService {
     /// Creates a new service. Does not attempt to connect to the Eth1 node.
     ///
     /// Modifies the given `config` to make it more suitable to the task of listening to genesis.
-    pub fn new(config: Eth1Config, log: Logger, spec: ChainSpec) -> Self {
+    pub fn new(config: Eth1Config, log: Logger, spec: Arc<ChainSpec>) -> Result<Self, String> {
         let config = Eth1Config {
             // Truncating the block cache makes searching for genesis more
             // complicated.
@@ -64,15 +64,16 @@ impl Eth1GenesisService {
             ..config
         };
 
-        Self {
-            eth1_service: Eth1Service::new(config, log, spec),
+        Ok(Self {
+            eth1_service: Eth1Service::new(config, log, spec)
+                .map_err(|e| format!("Failed to create eth1 service: {:?}", e))?,
             stats: Arc::new(Statistics {
                 highest_processed_block: AtomicU64::new(0),
                 active_validator_count: AtomicUsize::new(0),
                 total_deposit_count: AtomicUsize::new(0),
                 latest_timestamp: AtomicU64::new(0),
             }),
-        }
+        })
     }
 
     /// Returns the first eth1 block that has enough deposits that it's a (potentially invalid)
@@ -85,7 +86,7 @@ impl Eth1GenesisService {
                 .deposits()
                 .read()
                 .cache
-                .get(min_genesis_active_validator_count.saturating_sub(1))
+                .get_log(min_genesis_active_validator_count.saturating_sub(1))
                 .map(|log| log.block_number)
         }
     }
@@ -99,9 +100,9 @@ impl Eth1GenesisService {
     pub async fn wait_for_genesis_state<E: EthSpec>(
         &self,
         update_interval: Duration,
-        spec: ChainSpec,
     ) -> Result<BeaconState<E>, String> {
         let eth1_service = &self.eth1_service;
+        let spec = eth1_service.chain_spec();
         let log = &eth1_service.log;
 
         let mut sync_blocks = false;
@@ -112,11 +113,9 @@ impl Eth1GenesisService {
             "Importing eth1 deposit logs";
         );
 
-        let endpoints = eth1_service.init_endpoints();
-
         loop {
             let update_result = eth1_service
-                .update_deposit_cache(None, &endpoints)
+                .update_deposit_cache(None)
                 .await
                 .map_err(|e| format!("{:?}", e));
 
@@ -158,7 +157,7 @@ impl Eth1GenesisService {
             }
 
             // Download new eth1 blocks into the cache.
-            let blocks_imported = match eth1_service.update_block_cache(None, &endpoints).await {
+            let blocks_imported = match eth1_service.update_block_cache(None).await {
                 Ok(outcome) => {
                     debug!(
                         log,
@@ -181,16 +180,16 @@ impl Eth1GenesisService {
 
             // Scan the new eth1 blocks, searching for genesis.
             if let Some(genesis_state) =
-                self.scan_new_blocks::<E>(&mut highest_processed_block, &spec)?
+                self.scan_new_blocks::<E>(&mut highest_processed_block, spec)?
             {
                 info!(
                     log,
                     "Genesis ceremony complete";
                     "genesis_validators" => genesis_state
-                        .get_active_validator_indices(E::genesis_epoch(), &spec)
+                        .get_active_validator_indices(E::genesis_epoch(), spec)
                         .map_err(|e| format!("Genesis validators error: {:?}", e))?
                         .len(),
-                    "genesis_time" => genesis_state.genesis_time,
+                    "genesis_time" => genesis_state.genesis_time(),
                 );
                 break Ok(genesis_state);
             }
@@ -204,7 +203,7 @@ impl Eth1GenesisService {
             let latest_timestamp = self.stats.latest_timestamp.load(Ordering::Relaxed);
 
             // Perform some logging.
-            if timestamp_can_trigger_genesis(latest_timestamp, &spec)? {
+            if timestamp_can_trigger_genesis(latest_timestamp, spec)? {
                 // Indicate that we are awaiting adequate active validators.
                 if (active_validator_count as u64) < spec.min_genesis_active_validator_count {
                     info!(
@@ -316,7 +315,7 @@ impl Eth1GenesisService {
             //
             // Note: this state is fully valid, some fields have been bypassed to make verification
             // faster.
-            let state = self.cheap_state_at_eth1_block::<E>(block, &spec)?;
+            let state = self.cheap_state_at_eth1_block::<E>(block, spec)?;
             let active_validator_count = state
                 .get_active_validator_indices(E::genesis_epoch(), spec)
                 .map_err(|e| format!("Genesis validators error: {:?}", e))?
@@ -328,7 +327,7 @@ impl Eth1GenesisService {
 
             if is_valid_genesis_state(&state, spec) {
                 let genesis_state = self
-                    .genesis_from_eth1_block(block.clone(), &spec)
+                    .genesis_from_eth1_block(block.clone(), spec)
                     .map_err(|e| format!("Failed to generate valid genesis state : {}", e))?;
 
                 return Ok(Some(genesis_state));
@@ -353,7 +352,7 @@ impl Eth1GenesisService {
     ///
     /// - `Ok(genesis_state)`: if all went well.
     /// - `Err(e)`: if the given `eth1_block` was not a viable block to trigger genesis or there was
-    /// an internal error.
+    ///   an internal error.
     fn genesis_from_eth1_block<E: EthSpec>(
         &self,
         eth1_block: Eth1Block,
@@ -372,12 +371,13 @@ impl Eth1GenesisService {
         let genesis_state = initialize_beacon_state_from_eth1(
             eth1_block.hash,
             eth1_block.timestamp,
-            genesis_deposits(deposit_logs, &spec)?,
-            &spec,
+            genesis_deposits(deposit_logs, spec)?,
+            None,
+            spec,
         )
         .map_err(|e| format!("Unable to initialize genesis state: {:?}", e))?;
 
-        if is_valid_genesis_state(&genesis_state, &spec) {
+        if is_valid_genesis_state(&genesis_state, spec) {
             Ok(genesis_state)
         } else {
             Err("Generated state was not valid.".to_string())
@@ -406,7 +406,7 @@ impl Eth1GenesisService {
                 deposit_root: Hash256::zero(),
                 deposit_count: 0,
             },
-            &spec,
+            spec,
         );
 
         self.deposit_logs_at_block(eth1_block.number)
@@ -432,8 +432,14 @@ impl Eth1GenesisService {
                 // Such an optimization would only be useful in a scenario where `MIN_GENESIS_TIME`
                 // is reached _prior_ to `MIN_ACTIVE_VALIDATOR_COUNT`. I suspect this won't be the
                 // case for mainnet, so we defer this optimization.
+                let Deposit { proof, data } = deposit;
+                let proof = if PROOF_VERIFICATION {
+                    Some(proof)
+                } else {
+                    None
+                };
 
-                process_deposit(&mut state, &deposit, spec, PROOF_VERIFICATION)
+                apply_deposit(&mut state, data, proof, true, spec)
                     .map_err(|e| format!("Error whilst processing deposit: {:?}", e))
             })?;
 

@@ -1,5 +1,5 @@
 use crate::Hash256;
-use eth2_hashing::{Context, SHA256};
+use ethereum_hashing::hash_fixed;
 use std::mem;
 
 const SEED_SIZE: usize = 32;
@@ -31,12 +31,10 @@ impl Buf {
     /// Returns the new pivot. It is "raw" because it has not modulo the list size (this must be
     /// done by the caller).
     fn raw_pivot(&self) -> u64 {
-        let mut context = Context::new(&SHA256);
-        context.update(&self.0[0..PIVOT_VIEW_SIZE]);
-        let digest = context.finish();
+        let digest = hash_fixed(&self.0[0..PIVOT_VIEW_SIZE]);
 
         let mut bytes = [0; mem::size_of::<u64>()];
-        bytes[..].copy_from_slice(&digest.as_ref()[0..mem::size_of::<u64>()]);
+        bytes[..].copy_from_slice(&digest[0..mem::size_of::<u64>()]);
         u64::from_le_bytes(bytes)
     }
 
@@ -47,10 +45,7 @@ impl Buf {
 
     /// Hash the entire buffer.
     fn hash(&self) -> Hash256 {
-        let mut context = Context::new(&SHA256);
-        context.update(&self.0[..]);
-        let digest = context.finish();
-        Hash256::from_slice(digest.as_ref())
+        Hash256::from(hash_fixed(&self.0))
     }
 }
 
@@ -80,7 +75,7 @@ impl Buf {
 /// Returns `None` under any of the following conditions:
 ///  - `list_size == 0`
 ///  - `list_size > 2**24`
-///  - `list_size > usize::max_value() / 2`
+///  - `list_size > usize::MAX / 2`
 pub fn shuffle_list(
     mut input: Vec<usize>,
     rounds: u8,
@@ -89,10 +84,7 @@ pub fn shuffle_list(
 ) -> Option<Vec<usize>> {
     let list_size = input.len();
 
-    if input.is_empty()
-        || list_size > usize::max_value() / 2
-        || list_size > 2_usize.pow(24)
-        || rounds == 0
+    if input.is_empty() || list_size > usize::MAX / 2 || list_size > 2_usize.pow(24) || rounds == 0
     {
         return None;
     }

@@ -2,15 +2,18 @@
 mod macros;
 mod exit;
 
+use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType};
 use ssz::Encode;
-use state_processing::test_utils::BlockProcessingBuilder;
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use types::MainnetEthSpec;
-use types::{BeaconState, ChainSpec, EthSpec, SignedBeaconBlock};
+use std::sync::LazyLock;
+use types::{
+    test_utils::generate_deterministic_keypairs, BeaconState, EthSpec, Keypair, SignedBeaconBlock,
+};
+use types::{FixedBytesExtended, Hash256, MainnetEthSpec, Slot};
 
 type E = MainnetEthSpec;
 
@@ -19,9 +22,12 @@ pub const VALIDATOR_COUNT: usize = 64;
 /// The base output directory for test vectors.
 pub const BASE_VECTOR_DIR: &str = "vectors";
 
+pub const SLOT_OFFSET: u64 = 1;
+
 /// Writes all known test vectors to `CARGO_MANIFEST_DIR/vectors`.
-fn main() {
-    match write_all_vectors() {
+#[tokio::main]
+async fn main() {
+    match write_all_vectors().await {
         Ok(()) => exit(0),
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -39,21 +45,41 @@ pub struct TestVector {
     pub error: Option<String>,
 }
 
-/// Gets a `BlockProcessingBuilder` to be used in testing.
-fn get_builder(
-    spec: &ChainSpec,
-    epoch_offset: u64,
-    num_validators: usize,
-) -> BlockProcessingBuilder<MainnetEthSpec> {
-    // Set the state and block to be in the last slot of the `epoch_offset`th epoch.
-    let last_slot_of_epoch = (MainnetEthSpec::genesis_epoch() + epoch_offset)
-        .end_slot(MainnetEthSpec::slots_per_epoch());
-    BlockProcessingBuilder::new(num_validators, last_slot_of_epoch, &spec).build_caches()
+/// A cached set of keys.
+static KEYPAIRS: LazyLock<Vec<Keypair>> =
+    LazyLock::new(|| generate_deterministic_keypairs(VALIDATOR_COUNT));
+
+async fn get_harness<E: EthSpec>(
+    slot: Slot,
+    validator_count: usize,
+) -> BeaconChainHarness<EphemeralHarnessType<E>> {
+    let harness = BeaconChainHarness::builder(E::default())
+        .default_spec()
+        .keypairs(KEYPAIRS[0..validator_count].to_vec())
+        .fresh_ephemeral_store()
+        .build();
+    let skip_to_slot = slot - SLOT_OFFSET;
+    if skip_to_slot > Slot::new(0) {
+        let state = harness.get_current_state();
+        harness
+            .add_attested_blocks_at_slots(
+                state,
+                Hash256::zero(),
+                (skip_to_slot.as_u64()..slot.as_u64())
+                    .map(Slot::new)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                (0..validator_count).collect::<Vec<_>>().as_slice(),
+            )
+            .await;
+    }
+
+    harness
 }
 
 /// Writes all vectors to file.
-fn write_all_vectors() -> Result<(), String> {
-    write_vectors_to_file("exit", &exit::vectors())
+async fn write_all_vectors() -> Result<(), String> {
+    write_vectors_to_file("exit", &exit::vectors().await)
 }
 
 /// Writes a list of `vectors` to the `title` dir.

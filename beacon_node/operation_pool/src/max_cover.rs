@@ -1,3 +1,4 @@
+use crate::metrics;
 use itertools::Itertools;
 
 /// Trait for types that we can compute a maximum cover for.
@@ -6,20 +7,25 @@ use itertools::Itertools;
 /// * `item`: something that implements this trait
 /// * `element`: something contained in a set, and covered by the covering set of an item
 /// * `object`: something extracted from an item in order to comprise a solution
-/// See: https://en.wikipedia.org/wiki/Maximum_coverage_problem
+///   See: https://en.wikipedia.org/wiki/Maximum_coverage_problem
 pub trait MaxCover: Clone {
     /// The result type, of which we would eventually like a collection of maximal quality.
     type Object: Clone;
+    /// The intermediate object type, which can be converted to `Object`.
+    type Intermediate: Clone;
     /// The type used to represent sets.
     type Set: Clone;
 
-    /// Extract an object for inclusion in a solution.
-    fn object(&self) -> &Self::Object;
+    /// Extract the intermediate object.
+    fn intermediate(&self) -> &Self::Intermediate;
+
+    /// Convert the borrowed intermediate object to an owned object for the solution.
+    fn convert_to_object(intermediate: &Self::Intermediate) -> Self::Object;
 
     /// Get the set of elements covered.
     fn covering_set(&self) -> &Self::Set;
     /// Update the set of items covered, for the inclusion of some object in the solution.
-    fn update_covering_set(&mut self, max_obj: &Self::Object, max_set: &Self::Set);
+    fn update_covering_set(&mut self, max_obj: &Self::Intermediate, max_set: &Self::Set);
     /// The quality of this item's covering set, usually its cardinality.
     fn score(&self) -> usize;
 }
@@ -44,7 +50,7 @@ impl<T> MaxCoverItem<T> {
 ///
 /// * Time complexity: `O(limit * items_iter.len())`
 /// * Space complexity: `O(item_iter.len())`
-pub fn maximum_cover<I, T>(items_iter: I, limit: usize) -> Vec<T>
+pub fn maximum_cover<I, T>(items_iter: I, limit: usize, label: &str) -> Vec<T>
 where
     I: IntoIterator<Item = T>,
     T: MaxCover,
@@ -55,6 +61,12 @@ where
         .map(MaxCoverItem::new)
         .filter(|x| x.item.score() != 0)
         .collect();
+
+    metrics::set_int_gauge(
+        &metrics::MAX_COVER_NON_ZERO_ITEMS,
+        &[label],
+        all_items.len() as i64,
+    );
 
     let mut result = vec![];
 
@@ -79,7 +91,7 @@ where
             .filter(|x| x.available && x.item.score() != 0)
             .for_each(|x| {
                 x.item
-                    .update_covering_set(best.object(), best.covering_set())
+                    .update_covering_set(best.intermediate(), best.covering_set())
             });
 
         result.push(best);
@@ -99,14 +111,13 @@ where
         .into_iter()
         .merge_by(cover2, |item1, item2| item1.score() >= item2.score())
         .take(limit)
-        .map(|item| item.object().clone())
+        .map(|item| T::convert_to_object(item.intermediate()))
         .collect()
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::iter::FromIterator;
     use std::{collections::HashSet, hash::Hash};
 
     impl<T> MaxCover for HashSet<T>
@@ -114,14 +125,19 @@ mod test {
         T: Clone + Eq + Hash,
     {
         type Object = Self;
+        type Intermediate = Self;
         type Set = Self;
 
-        fn object(&self) -> &Self {
+        fn intermediate(&self) -> &Self {
             self
         }
 
+        fn convert_to_object(set: &Self) -> Self {
+            set.clone()
+        }
+
         fn covering_set(&self) -> &Self {
-            &self
+            self
         }
 
         fn update_covering_set(&mut self, _: &Self, other: &Self) {
@@ -146,14 +162,14 @@ mod test {
 
     #[test]
     fn zero_limit() {
-        let cover = maximum_cover(example_system(), 0);
+        let cover = maximum_cover(example_system(), 0, "test");
         assert_eq!(cover.len(), 0);
     }
 
     #[test]
     fn one_limit() {
         let sets = example_system();
-        let cover = maximum_cover(sets.clone(), 1);
+        let cover = maximum_cover(sets.clone(), 1, "test");
         assert_eq!(cover.len(), 1);
         assert_eq!(cover[0], sets[1]);
     }
@@ -163,7 +179,7 @@ mod test {
     fn exclude_zero_score() {
         let sets = example_system();
         for k in 2..10 {
-            let cover = maximum_cover(sets.clone(), k);
+            let cover = maximum_cover(sets.clone(), k, "test");
             assert_eq!(cover.len(), 2);
             assert_eq!(cover[0], sets[1]);
             assert_eq!(cover[1], sets[0]);
@@ -187,7 +203,7 @@ mod test {
             HashSet::from_iter(vec![5, 6, 7, 8]),      // 4, 4*
             HashSet::from_iter(vec![0, 1, 2, 3, 4]),   // 5*
         ];
-        let cover = maximum_cover(sets, 3);
+        let cover = maximum_cover(sets, 3, "test");
         assert_eq!(quality(&cover), 11);
     }
 
@@ -202,7 +218,7 @@ mod test {
             HashSet::from_iter(vec![1, 5, 6, 8]),
             HashSet::from_iter(vec![1, 7, 11, 19]),
         ];
-        let cover = maximum_cover(sets, 5);
+        let cover = maximum_cover(sets, 5, "test");
         assert_eq!(quality(&cover), 19);
         assert_eq!(cover.len(), 5);
     }

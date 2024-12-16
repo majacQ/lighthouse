@@ -1,27 +1,26 @@
 use crate::chunked_vector::{chunk_key, Chunk, Field};
 use crate::{HotColdDB, ItemStore};
 use slog::error;
-use std::sync::Arc;
 use types::{ChainSpec, EthSpec, Slot};
 
 /// Iterator over the values of a `BeaconState` vector field (like `block_roots`).
 ///
 /// Uses the freezer DB's separate table to load the values.
-pub struct ChunkedVectorIter<F, E, Hot, Cold>
+pub struct ChunkedVectorIter<'a, F, E, Hot, Cold>
 where
     F: Field<E>,
     E: EthSpec,
     Hot: ItemStore<E>,
     Cold: ItemStore<E>,
 {
-    pub(crate) store: Arc<HotColdDB<E, Hot, Cold>>,
+    pub(crate) store: &'a HotColdDB<E, Hot, Cold>,
     current_vindex: usize,
     pub(crate) end_vindex: usize,
     next_cindex: usize,
     current_chunk: Chunk<F::Value>,
 }
 
-impl<F, E, Hot, Cold> ChunkedVectorIter<F, E, Hot, Cold>
+impl<'a, F, E, Hot, Cold> ChunkedVectorIter<'a, F, E, Hot, Cold>
 where
     F: Field<E>,
     E: EthSpec,
@@ -31,16 +30,16 @@ where
     /// Create a new iterator which can yield elements from `start_vindex` up to the last
     /// index stored by the restore point at `last_restore_point_slot`.
     ///
-    /// The `last_restore_point` slot should be the slot of a recent restore point as obtained from
-    /// `HotColdDB::get_latest_restore_point_slot`. We pass it as a parameter so that the caller can
+    /// The `freezer_upper_limit` slot should be the slot of a recent restore point as obtained from
+    /// `Root::freezer_upper_limit`. We pass it as a parameter so that the caller can
     /// maintain a stable view of the database (see `HybridForwardsBlockRootsIterator`).
     pub fn new(
-        store: Arc<HotColdDB<E, Hot, Cold>>,
+        store: &'a HotColdDB<E, Hot, Cold>,
         start_vindex: usize,
-        last_restore_point_slot: Slot,
+        freezer_upper_limit: Slot,
         spec: &ChainSpec,
     ) -> Self {
-        let (_, end_vindex) = F::start_and_end_vindex(last_restore_point_slot, spec);
+        let (_, end_vindex) = F::start_and_end_vindex(freezer_upper_limit, spec);
 
         // Set the next chunk to the one containing `start_vindex`.
         let next_cindex = start_vindex / F::chunk_size();
@@ -57,7 +56,7 @@ where
     }
 }
 
-impl<F, E, Hot, Cold> Iterator for ChunkedVectorIter<F, E, Hot, Cold>
+impl<F, E, Hot, Cold> Iterator for ChunkedVectorIter<'_, F, E, Hot, Cold>
 where
     F: Field<E>,
     E: EthSpec,
@@ -97,7 +96,7 @@ where
             self.current_chunk = Chunk::load(
                 &self.store.cold_db,
                 F::column(),
-                &chunk_key(self.next_cindex as u64),
+                &chunk_key(self.next_cindex),
             )
             .map_err(|e| {
                 error!(

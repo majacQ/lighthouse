@@ -2,14 +2,11 @@
 name = "timer"
 version = "0.2.0"
 authors = ["Sigma Prime <contact@sigmaprime.io>"]
-edition = "2018"
+edition = { workspace = true }
 
 [dependencies]
-beacon_chain =  { path = "../beacon_chain" }
-types = { path = "../../consensus/types" }
-slot_clock = { path = "../../common/slot_clock" }
-tokio = { version = "1.1.0", features = ["full"] }
-slog = "2.5.2"
-parking_lot = "0.11.0"
-futures = "0.3.7"
-task_executor = { path = "../../common/task_executor" }
+beacon_chain = { workspace = true }
+slot_clock = { workspace = true }
+tokio = { workspace = true }
+slog = { workspace = true }
+task_executor = { workspace = true }

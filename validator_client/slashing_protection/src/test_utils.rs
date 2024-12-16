@@ -1,13 +1,10 @@
 use crate::*;
 use tempfile::{tempdir, TempDir};
-use types::{
-    test_utils::generate_deterministic_keypair, AttestationData, BeaconBlockHeader, Hash256,
-    PublicKeyBytes,
-};
+use types::{test_utils::generate_deterministic_keypair, AttestationData, BeaconBlockHeader};
 
 pub const DEFAULT_VALIDATOR_INDEX: usize = 0;
-pub const DEFAULT_DOMAIN: Hash256 = Hash256::zero();
-pub const DEFAULT_GENESIS_VALIDATORS_ROOT: Hash256 = Hash256::zero();
+pub const DEFAULT_DOMAIN: Hash256 = Hash256::ZERO;
+pub const DEFAULT_GENESIS_VALIDATORS_ROOT: Hash256 = Hash256::ZERO;
 
 pub fn pubkey(index: usize) -> PublicKeyBytes {
     generate_deterministic_keypair(index).pk.compress()
@@ -73,16 +70,6 @@ impl<T> Default for StreamTest<T> {
     }
 }
 
-impl<T> StreamTest<T> {
-    /// The number of test cases that are expected to pass processing successfully.
-    fn num_expected_successes(&self) -> usize {
-        self.cases
-            .iter()
-            .filter(|case| case.expected.is_ok())
-            .count()
-    }
-}
-
 impl StreamTest<AttestationData> {
     pub fn run(&self) {
         let dir = tempdir().unwrap();
@@ -93,6 +80,8 @@ impl StreamTest<AttestationData> {
             slashing_db.register_validator(*pubkey).unwrap();
         }
 
+        check_registration_invariants(&slashing_db, &self.registered_validators);
+
         for (i, test) in self.cases.iter().enumerate() {
             assert_eq!(
                 slashing_db.check_and_insert_attestation(&test.pubkey, &test.data, test.domain),
@@ -102,7 +91,7 @@ impl StreamTest<AttestationData> {
             );
         }
 
-        roundtrip_database(&dir, &slashing_db, self.num_expected_successes() == 0);
+        roundtrip_database(&dir, &slashing_db, self.registered_validators.is_empty());
     }
 }
 
@@ -116,6 +105,8 @@ impl StreamTest<BeaconBlockHeader> {
             slashing_db.register_validator(*pubkey).unwrap();
         }
 
+        check_registration_invariants(&slashing_db, &self.registered_validators);
+
         for (i, test) in self.cases.iter().enumerate() {
             assert_eq!(
                 slashing_db.check_and_insert_block_proposal(&test.pubkey, &test.data, test.domain),
@@ -125,13 +116,15 @@ impl StreamTest<BeaconBlockHeader> {
             );
         }
 
-        roundtrip_database(&dir, &slashing_db, self.num_expected_successes() == 0);
+        roundtrip_database(&dir, &slashing_db, self.registered_validators.is_empty());
     }
 }
 
+// This function roundtrips the database, but applies minification in order to be compatible with
+// the implicit minification done on import.
 fn roundtrip_database(dir: &TempDir, db: &SlashingDatabase, is_empty: bool) {
     let exported = db
-        .export_interchange_info(DEFAULT_GENESIS_VALIDATORS_ROOT)
+        .export_all_interchange_info(DEFAULT_GENESIS_VALIDATORS_ROOT)
         .unwrap();
     let new_db =
         SlashingDatabase::create(&dir.path().join("roundtrip_slashing_protection.sqlite")).unwrap();
@@ -139,9 +132,28 @@ fn roundtrip_database(dir: &TempDir, db: &SlashingDatabase, is_empty: bool) {
         .import_interchange_info(exported.clone(), DEFAULT_GENESIS_VALIDATORS_ROOT)
         .unwrap();
     let reexported = new_db
-        .export_interchange_info(DEFAULT_GENESIS_VALIDATORS_ROOT)
+        .export_all_interchange_info(DEFAULT_GENESIS_VALIDATORS_ROOT)
         .unwrap();
 
-    assert_eq!(exported, reexported);
+    assert!(exported
+        .minify()
+        .unwrap()
+        .equiv(&reexported.minify().unwrap()));
     assert_eq!(is_empty, exported.is_empty());
+}
+
+fn check_registration_invariants(
+    slashing_db: &SlashingDatabase,
+    registered_validators: &[PublicKeyBytes],
+) {
+    slashing_db
+        .check_validator_registrations(registered_validators.iter())
+        .unwrap();
+    let registered_list = slashing_db
+        .with_transaction(|txn| slashing_db.list_all_registered_validators(txn))
+        .unwrap()
+        .into_iter()
+        .map(|(_, pubkey)| pubkey)
+        .collect::<Vec<_>>();
+    assert_eq!(registered_validators, registered_list);
 }

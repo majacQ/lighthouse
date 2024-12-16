@@ -1,52 +1,103 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 
-use super::BeaconState;
 use crate::*;
 use core::num::NonZeroUsize;
+use derivative::Derivative;
 use safe_arith::SafeArith;
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
+use ssz::{four_byte_option_impl, Decode, DecodeError, Encode};
 use ssz_derive::{Decode, Encode};
 use std::ops::Range;
+use std::sync::Arc;
 use swap_or_not_shuffle::shuffle_list;
 
 mod tests;
 
+// Define "legacy" implementations of `Option<Epoch>`, `Option<NonZeroUsize>` which use four bytes
+// for encoding the union selector.
+four_byte_option_impl!(four_byte_option_epoch, Epoch);
+four_byte_option_impl!(four_byte_option_non_zero_usize, NonZeroUsize);
+
 /// Computes and stores the shuffling for an epoch. Provides various getters to allow callers to
 /// read the committees for the given epoch.
-#[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Derivative, Debug, Default, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derivative(PartialEq)]
 pub struct CommitteeCache {
+    #[ssz(with = "four_byte_option_epoch")]
     initialized_epoch: Option<Epoch>,
     shuffling: Vec<usize>,
-    shuffling_positions: Vec<Option<NonZeroUsize>>,
+    #[derivative(PartialEq(compare_with = "compare_shuffling_positions"))]
+    shuffling_positions: Vec<NonZeroUsizeOption>,
     committees_per_slot: u64,
     slots_per_epoch: u64,
+}
+
+/// Equivalence function for `shuffling_positions` that ignores trailing `None` entries.
+///
+/// It can happen that states from different epochs computing the same cache have different
+/// numbers of validators in `state.validators()` due to recent deposits. These new validators
+/// cannot be active however and will always be omitted from the shuffling. This function checks
+/// that two lists of shuffling positions are equivalent by ensuring that they are identical on all
+/// common entries, and that new entries at the end are all `None`.
+///
+/// In practice this is only used in tests.
+#[allow(clippy::indexing_slicing)]
+fn compare_shuffling_positions(xs: &Vec<NonZeroUsizeOption>, ys: &Vec<NonZeroUsizeOption>) -> bool {
+    use std::cmp::Ordering;
+
+    let (shorter, longer) = match xs.len().cmp(&ys.len()) {
+        Ordering::Equal => {
+            return xs == ys;
+        }
+        Ordering::Less => (xs, ys),
+        Ordering::Greater => (ys, xs),
+    };
+    shorter == &longer[..shorter.len()]
+        && longer[shorter.len()..]
+            .iter()
+            .all(|new| *new == NonZeroUsizeOption(None))
 }
 
 impl CommitteeCache {
     /// Return a new, fully initialized cache.
     ///
     /// Spec v0.12.1
-    pub fn initialized<T: EthSpec>(
-        state: &BeaconState<T>,
+    pub fn initialized<E: EthSpec>(
+        state: &BeaconState<E>,
         epoch: Epoch,
         spec: &ChainSpec,
-    ) -> Result<CommitteeCache, Error> {
-        RelativeEpoch::from_epoch(state.current_epoch(), epoch)
-            .map_err(|_| Error::EpochOutOfBounds)?;
+    ) -> Result<Arc<CommitteeCache>, Error> {
+        // Check that the cache is being built for an in-range epoch.
+        //
+        // We allow caches to be constructed for historic epochs, per:
+        //
+        // https://github.com/sigp/lighthouse/issues/3270
+        let reqd_randao_epoch = epoch
+            .saturating_sub(spec.min_seed_lookahead)
+            .saturating_sub(1u64);
+
+        if reqd_randao_epoch < state.min_randao_epoch() || epoch > state.current_epoch() + 1 {
+            return Err(Error::EpochOutOfBounds);
+        }
 
         // May cause divide-by-zero errors.
-        if T::slots_per_epoch() == 0 {
+        if E::slots_per_epoch() == 0 {
             return Err(Error::ZeroSlotsPerEpoch);
         }
 
-        let active_validator_indices = get_active_validator_indices(&state.validators, epoch);
+        // The use of `NonZeroUsize` reduces the maximum number of possible validators by one.
+        if state.validators().len() == usize::MAX {
+            return Err(Error::TooManyValidators);
+        }
+
+        let active_validator_indices = get_active_validator_indices(state.validators(), epoch);
 
         if active_validator_indices.is_empty() {
             return Err(Error::InsufficientValidators);
         }
 
         let committees_per_slot =
-            T::get_committee_count_per_slot(active_validator_indices.len(), spec)? as u64;
+            E::get_committee_count_per_slot(active_validator_indices.len(), spec)? as u64;
 
         let seed = state.get_seed(epoch, Domain::BeaconAttester, spec)?;
 
@@ -58,23 +109,20 @@ impl CommitteeCache {
         )
         .ok_or(Error::UnableToShuffle)?;
 
-        // The use of `NonZeroUsize` reduces the maximum number of possible validators by one.
-        if state.validators.len() == usize::max_value() {
-            return Err(Error::TooManyValidators);
+        let mut shuffling_positions = vec![<_>::default(); state.validators().len()];
+        for (i, &v) in shuffling.iter().enumerate() {
+            *shuffling_positions
+                .get_mut(v)
+                .ok_or(Error::ShuffleIndexOutOfBounds(v))? = NonZeroUsize::new(i + 1).into();
         }
 
-        let mut shuffling_positions = vec![None; state.validators.len()];
-        for (i, v) in shuffling.iter().enumerate() {
-            shuffling_positions[*v] = NonZeroUsize::new(i + 1);
-        }
-
-        Ok(CommitteeCache {
+        Ok(Arc::new(CommitteeCache {
             initialized_epoch: Some(epoch),
             shuffling,
             shuffling_positions,
             committees_per_slot,
-            slots_per_epoch: T::slots_per_epoch(),
-        })
+            slots_per_epoch: E::slots_per_epoch(),
+        }))
     }
 
     /// Returns `true` if the cache has been initialized at the supplied `epoch`.
@@ -119,9 +167,13 @@ impl CommitteeCache {
             return None;
         }
 
-        let committee_index =
-            (slot.as_u64() % self.slots_per_epoch) * self.committees_per_slot + index;
-        let committee = self.compute_committee(committee_index as usize)?;
+        let committee_index = compute_committee_index_in_epoch(
+            slot,
+            self.slots_per_epoch as usize,
+            self.committees_per_slot as usize,
+            index as usize,
+        );
+        let committee = self.compute_committee(committee_index)?;
 
         Some(BeaconCommittee {
             slot,
@@ -131,6 +183,8 @@ impl CommitteeCache {
     }
 
     /// Get all the Beacon committees at a given `slot`.
+    ///
+    /// Committees are sorted by ascending index order 0..committees_per_slot
     pub fn get_beacon_committees_at_slot(&self, slot: Slot) -> Result<Vec<BeaconCommittee>, Error> {
         if self.initialized_epoch.is_none() {
             return Err(Error::CommitteeCacheUninitialized(None));
@@ -151,7 +205,7 @@ impl CommitteeCache {
             .ok_or(Error::CommitteeCacheUninitialized(None))?;
 
         initialized_epoch.slot_iter(self.slots_per_epoch).try_fold(
-            Vec::with_capacity(self.slots_per_epoch as usize),
+            Vec::with_capacity(self.epoch_committee_count()),
             |mut vec, slot| {
                 vec.append(&mut self.get_beacon_committees_at_slot(slot)?);
                 Ok(vec)
@@ -217,7 +271,10 @@ impl CommitteeCache {
     ///
     /// Spec v0.12.1
     pub fn epoch_committee_count(&self) -> usize {
-        self.committees_per_slot as usize * self.slots_per_epoch as usize
+        epoch_committee_count(
+            self.committees_per_slot as usize,
+            self.slots_per_epoch as usize,
+        )
     }
 
     /// Returns the number of committees per slot for this cache's epoch.
@@ -229,7 +286,7 @@ impl CommitteeCache {
     ///
     /// Spec v0.12.1
     fn compute_committee(&self, index: usize) -> Option<&[usize]> {
-        Some(&self.shuffling[self.compute_committee_range(index)?])
+        self.shuffling.get(self.compute_committee_range(index)?)
     }
 
     /// Returns a range of `self.shuffling` that represents the `index`'th committee in the epoch.
@@ -240,49 +297,131 @@ impl CommitteeCache {
     ///
     /// Spec v0.12.1
     fn compute_committee_range(&self, index: usize) -> Option<Range<usize>> {
-        let count = self.epoch_committee_count();
-        if count == 0 || index >= count {
-            return None;
-        }
-
-        let num_validators = self.shuffling.len();
-        let start = (num_validators * index) / count;
-        let end = (num_validators * (index + 1)) / count;
-
-        Some(start..end)
+        compute_committee_range_in_epoch(self.epoch_committee_count(), index, self.shuffling.len())
     }
 
     /// Returns the index of some validator in `self.shuffling`.
     ///
     /// Always returns `None` for a non-initialized epoch.
-    fn shuffled_position(&self, validator_index: usize) -> Option<usize> {
+    pub fn shuffled_position(&self, validator_index: usize) -> Option<usize> {
         self.shuffling_positions
             .get(validator_index)?
-            .and_then(|p| Some(p.get() - 1))
+            .0
+            .map(|p| p.get() - 1)
     }
+}
+
+/// Computes the position of the given `committee_index` with respect to all committees in the
+/// epoch.
+///
+/// The return result may be used to provide input to the `compute_committee_range_in_epoch`
+/// function.
+pub fn compute_committee_index_in_epoch(
+    slot: Slot,
+    slots_per_epoch: usize,
+    committees_per_slot: usize,
+    committee_index: usize,
+) -> usize {
+    (slot.as_usize() % slots_per_epoch) * committees_per_slot + committee_index
+}
+
+/// Computes the range for slicing the shuffled indices to determine the members of a committee.
+///
+/// The `index_in_epoch` parameter can be computed computed using
+/// `compute_committee_index_in_epoch`.
+pub fn compute_committee_range_in_epoch(
+    epoch_committee_count: usize,
+    index_in_epoch: usize,
+    shuffling_len: usize,
+) -> Option<Range<usize>> {
+    if epoch_committee_count == 0 || index_in_epoch >= epoch_committee_count {
+        return None;
+    }
+
+    let start = (shuffling_len * index_in_epoch) / epoch_committee_count;
+    let end = (shuffling_len * (index_in_epoch + 1)) / epoch_committee_count;
+
+    Some(start..end)
+}
+
+/// Returns the total number of committees in an epoch.
+pub fn epoch_committee_count(committees_per_slot: usize, slots_per_epoch: usize) -> usize {
+    committees_per_slot * slots_per_epoch
 }
 
 /// Returns a list of all `validators` indices where the validator is active at the given
 /// `epoch`.
 ///
 /// Spec v0.12.1
-pub fn get_active_validator_indices(validators: &[Validator], epoch: Epoch) -> Vec<usize> {
-    let mut active = Vec::with_capacity(validators.len());
+pub fn get_active_validator_indices<'a, V, I>(validators: V, epoch: Epoch) -> Vec<usize>
+where
+    V: IntoIterator<Item = &'a Validator, IntoIter = I>,
+    I: ExactSizeIterator + Iterator<Item = &'a Validator>,
+{
+    let iter = validators.into_iter();
 
-    for (index, validator) in validators.iter().enumerate() {
+    let mut active = Vec::with_capacity(iter.len());
+
+    for (index, validator) in iter.enumerate() {
         if validator.is_active_at(epoch) {
             active.push(index)
         }
     }
 
-    active.shrink_to_fit();
-
     active
 }
 
-#[cfg(feature = "arbitrary-fuzz")]
-impl arbitrary::Arbitrary for CommitteeCache {
+impl arbitrary::Arbitrary<'_> for CommitteeCache {
     fn arbitrary(_u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         Ok(Self::default())
+    }
+}
+
+/// This is a shim struct to ensure that we can encode a `Vec<Option<NonZeroUsize>>` an SSZ union
+/// with a four-byte selector. The SSZ specification changed from four bytes to one byte during 2021
+/// and we use this shim to avoid breaking the Lighthouse database.
+#[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct NonZeroUsizeOption(Option<NonZeroUsize>);
+
+impl From<Option<NonZeroUsize>> for NonZeroUsizeOption {
+    fn from(opt: Option<NonZeroUsize>) -> Self {
+        Self(opt)
+    }
+}
+
+impl Encode for NonZeroUsizeOption {
+    fn is_ssz_fixed_len() -> bool {
+        four_byte_option_non_zero_usize::encode::is_ssz_fixed_len()
+    }
+
+    fn ssz_fixed_len() -> usize {
+        four_byte_option_non_zero_usize::encode::ssz_fixed_len()
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        four_byte_option_non_zero_usize::encode::ssz_bytes_len(&self.0)
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        four_byte_option_non_zero_usize::encode::ssz_append(&self.0, buf)
+    }
+
+    fn as_ssz_bytes(&self) -> Vec<u8> {
+        four_byte_option_non_zero_usize::encode::as_ssz_bytes(&self.0)
+    }
+}
+
+impl Decode for NonZeroUsizeOption {
+    fn is_ssz_fixed_len() -> bool {
+        four_byte_option_non_zero_usize::decode::is_ssz_fixed_len()
+    }
+
+    fn ssz_fixed_len() -> usize {
+        four_byte_option_non_zero_usize::decode::ssz_fixed_len()
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        four_byte_option_non_zero_usize::decode::from_ssz_bytes(bytes).map(Self)
     }
 }

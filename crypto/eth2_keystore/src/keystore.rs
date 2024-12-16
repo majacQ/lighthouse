@@ -7,9 +7,9 @@ use crate::json_keystore::{
     Kdf, KdfModule, Scrypt, Sha256Checksum, Version,
 };
 use crate::Uuid;
-use aes_ctr::cipher::generic_array::GenericArray;
-use aes_ctr::cipher::{NewStreamCipher, SyncStreamCipher};
-use aes_ctr::Aes128Ctr as AesCtr;
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{NewCipher, StreamCipher};
+use aes::Aes128Ctr as AesCtr;
 use bls::{Keypair, PublicKey, SecretKey, ZeroizeHash};
 use eth2_key_derivation::PlainText;
 use hmac::Hmac;
@@ -17,13 +17,12 @@ use pbkdf2::pbkdf2;
 use rand::prelude::*;
 use scrypt::{
     errors::{InvalidOutputLen, InvalidParams},
-    scrypt, ScryptParams,
+    scrypt, Params as ScryptParams,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::{Read, Write};
-use std::iter::FromIterator;
 use std::path::Path;
 use std::str;
 use unicode_normalization::UnicodeNormalization;
@@ -230,7 +229,7 @@ impl Keystore {
                 },
                 uuid,
                 path: Some(path),
-                pubkey: keypair.pk.to_hex_string()[2..].to_string(),
+                pubkey: keypair.pk.as_hex_string()[2..].to_string(),
                 version: Version::four(),
                 description: Some(description),
                 name: None,
@@ -261,7 +260,7 @@ impl Keystore {
 
         let keypair = keypair_from_secret(plain_text.as_bytes())?;
         // Verify that the derived `PublicKey` matches `self`.
-        if keypair.pk.to_hex_string()[2..] != self.json.pubkey {
+        if keypair.pk.as_hex_string()[2..] != self.json.pubkey {
             return Err(Error::PublicKeyMismatch);
         }
 
@@ -329,7 +328,7 @@ impl Keystore {
 
     /// Instantiates `self` by reading a JSON file at `path`.
     pub fn from_json_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        OpenOptions::new()
+        File::options()
             .read(true)
             .write(false)
             .create(false)
@@ -377,7 +376,7 @@ pub fn encrypt(
 
     password.retain(|c| !is_control_character(c));
 
-    let derived_key = derive_key(&password.as_ref(), &kdf)?;
+    let derived_key = derive_key(password.as_ref(), kdf)?;
 
     // Encrypt secret.
     let mut cipher_text = plain_text.to_vec();
@@ -389,7 +388,7 @@ pub fn encrypt(
             // AES Encrypt
             let key = GenericArray::from_slice(&derived_key.as_bytes()[0..16]);
             let nonce = GenericArray::from_slice(params.iv.as_bytes());
-            let mut cipher = AesCtr::new(&key, &nonce);
+            let mut cipher = AesCtr::new(key, nonce);
             cipher.apply_keystream(&mut cipher_text);
         }
     };
@@ -435,7 +434,7 @@ pub fn decrypt(password: &[u8], crypto: &Crypto) -> Result<PlainText, Error> {
             // AES Decrypt
             let key = GenericArray::from_slice(&derived_key.as_bytes()[0..16]);
             let nonce = GenericArray::from_slice(params.iv.as_bytes());
-            let mut cipher = AesCtr::new(&key, &nonce);
+            let mut cipher = AesCtr::new(key, nonce);
             cipher.apply_keystream(plain_text.as_mut_bytes());
         }
     };

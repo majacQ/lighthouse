@@ -1,11 +1,14 @@
 use crate::{
     generic_aggregate_public_key::TAggregatePublicKey,
     generic_aggregate_signature::TAggregateSignature,
-    generic_public_key::{GenericPublicKey, TPublicKey, PUBLIC_KEY_BYTES_LEN},
+    generic_public_key::{
+        GenericPublicKey, TPublicKey, PUBLIC_KEY_BYTES_LEN, PUBLIC_KEY_UNCOMPRESSED_BYTES_LEN,
+    },
     generic_secret_key::{TSecretKey, SECRET_KEY_BYTES_LEN},
     generic_signature::{TSignature, SIGNATURE_BYTES_LEN},
     Error, Hash256, ZeroizeHash, INFINITY_PUBLIC_KEY, INFINITY_SIGNATURE,
 };
+
 /// Provides the externally-facing, core BLS types.
 pub mod types {
     pub use super::verify_signature_sets;
@@ -45,10 +48,18 @@ impl TPublicKey for PublicKey {
         self.0
     }
 
+    fn serialize_uncompressed(&self) -> [u8; PUBLIC_KEY_UNCOMPRESSED_BYTES_LEN] {
+        panic!("fake_crypto does not support uncompressed keys")
+    }
+
     fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
         let mut pubkey = Self::infinity();
         pubkey.0[..].copy_from_slice(&bytes[0..PUBLIC_KEY_BYTES_LEN]);
         Ok(pubkey)
+    }
+
+    fn deserialize_uncompressed(_: &[u8]) -> Result<Self, Error> {
+        panic!("fake_crypto does not support uncompressed keys")
     }
 }
 
@@ -63,7 +74,15 @@ impl PartialEq for PublicKey {
 #[derive(Clone)]
 pub struct AggregatePublicKey([u8; PUBLIC_KEY_BYTES_LEN]);
 
-impl TAggregatePublicKey for AggregatePublicKey {}
+impl TAggregatePublicKey<PublicKey> for AggregatePublicKey {
+    fn to_public_key(&self) -> GenericPublicKey<PublicKey> {
+        GenericPublicKey::from_point(PublicKey(self.0))
+    }
+
+    fn aggregate(_pubkeys: &[GenericPublicKey<PublicKey>]) -> Result<Self, Error> {
+        Ok(Self(INFINITY_PUBLIC_KEY))
+    }
+}
 
 impl Eq for AggregatePublicKey {}
 
@@ -104,6 +123,14 @@ impl PartialEq for Signature {
     }
 }
 
+impl Eq for Signature {}
+
+impl std::hash::Hash for Signature {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        self.0.hash(hasher);
+    }
+}
+
 #[derive(Clone)]
 pub struct AggregateSignature([u8; SIGNATURE_BYTES_LEN]);
 
@@ -137,7 +164,7 @@ impl TAggregateSignature<PublicKey, AggregatePublicKey, Signature> for Aggregate
     fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
         let mut key = [0; SIGNATURE_BYTES_LEN];
 
-        key[..].copy_from_slice(&bytes);
+        key[..].copy_from_slice(bytes);
 
         Ok(Self(key))
     }

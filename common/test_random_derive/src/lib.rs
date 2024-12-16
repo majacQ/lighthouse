@@ -1,6 +1,4 @@
-extern crate proc_macro;
-
-use crate::proc_macro::TokenStream;
+use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, DeriveInput};
 
@@ -10,7 +8,7 @@ use syn::{parse_macro_input, DeriveInput};
 /// The field attribute is: `#[test_random(default)]`
 fn should_use_default(field: &syn::Field) -> bool {
     field.attrs.iter().any(|attr| {
-        attr.path.is_ident("test_random") && attr.tokens.to_string().replace(" ", "") == "(default)"
+        attr.path.is_ident("test_random") && attr.tokens.to_string().replace(' ', "") == "(default)"
     })
 }
 
@@ -20,9 +18,8 @@ pub fn test_random_derive(input: TokenStream) -> TokenStream {
     let name = &derived_input.ident;
     let (impl_generics, ty_generics, where_clause) = &derived_input.generics.split_for_impl();
 
-    let struct_data = match &derived_input.data {
-        syn::Data::Struct(s) => s,
-        _ => panic!("test_random_derive only supports structs."),
+    let syn::Data::Struct(struct_data) = &derived_input.data else {
+        panic!("test_random_derive only supports structs.");
     };
 
     // Build quotes for fields that should be generated and those that should be built from

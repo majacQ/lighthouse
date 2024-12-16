@@ -1,9 +1,13 @@
 mod fork_choice;
 mod fork_choice_store;
+mod metrics;
 
 pub use crate::fork_choice::{
-    Error, ForkChoice, InvalidAttestation, InvalidBlock, PersistedForkChoice, QueuedAttestation,
-    SAFE_SLOTS_TO_UPDATE_JUSTIFIED,
+    AttestationFromBlock, Error, ForkChoice, ForkChoiceView, ForkchoiceUpdateParameters,
+    InvalidAttestation, InvalidBlock, PayloadVerificationStatus, PersistedForkChoice,
+    QueuedAttestation, ResetPayloadStatuses,
 };
 pub use fork_choice_store::ForkChoiceStore;
-pub use proto_array::Block as ProtoBlock;
+pub use proto_array::{
+    Block as ProtoBlock, ExecutionStatus, InvalidationOperation, ProposerHeadError,
+};

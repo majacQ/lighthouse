@@ -1,7 +1,8 @@
 use crate::test_utils::TestRandom;
 use crate::{Checkpoint, Hash256, SignedRoot, Slot};
 
-use serde_derive::{Deserialize, Serialize};
+use crate::slot_data::SlotData;
+use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use test_random_derive::TestRandom;
 use tree_hash_derive::TreeHash;
@@ -9,8 +10,8 @@ use tree_hash_derive::TreeHash;
 /// The data upon which an attestation is based.
 ///
 /// Spec v0.12.1
-#[cfg_attr(feature = "arbitrary-fuzz", derive(arbitrary::Arbitrary))]
 #[derive(
+    arbitrary::Arbitrary,
     Debug,
     Clone,
     PartialEq,
@@ -38,6 +39,12 @@ pub struct AttestationData {
 }
 
 impl SignedRoot for AttestationData {}
+
+impl SlotData for AttestationData {
+    fn get_slot(&self) -> Slot {
+        self.slot
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,9 @@
 use slashing_protection::interchange_test::MultiTestCase;
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+pub static TEST_ROOT_DIR: LazyLock<PathBuf> = LazyLock::new(test_root_dir);
 
 fn download_tests() {
     let make_output = std::process::Command::new("make")
@@ -20,9 +23,11 @@ fn test_root_dir() -> PathBuf {
         .join("tests")
 }
 
+// NOTE: I've combined two tests together to avoid a race-condition which occurs when fighting over
+// which test builds the TEST_ROOT_DIR lazy static.
 #[test]
-fn generated() {
-    for entry in test_root_dir()
+fn generated_and_with_minification() {
+    for entry in TEST_ROOT_DIR
         .join("generated")
         .read_dir()
         .unwrap()
@@ -30,6 +35,17 @@ fn generated() {
     {
         let file = File::open(entry.path()).unwrap();
         let test_case: MultiTestCase = serde_json::from_reader(&file).unwrap();
-        test_case.run();
+        test_case.run(false);
+    }
+
+    for entry in TEST_ROOT_DIR
+        .join("generated")
+        .read_dir()
+        .unwrap()
+        .map(Result::unwrap)
+    {
+        let file = File::open(entry.path()).unwrap();
+        let test_case: MultiTestCase = serde_json::from_reader(&file).unwrap();
+        test_case.run(true);
     }
 }

@@ -1,12 +1,12 @@
 use crate::builder::{
-    ETH1_DEPOSIT_AMOUNT_FILE, ETH1_DEPOSIT_DATA_FILE, VOTING_KEYSTORE_FILE,
+    keystore_password_path, ETH1_DEPOSIT_AMOUNT_FILE, ETH1_DEPOSIT_DATA_FILE, VOTING_KEYSTORE_FILE,
     WITHDRAWAL_KEYSTORE_FILE,
 };
 use deposit_contract::decode_eth1_tx_data;
 use derivative::Derivative;
 use eth2_keystore::{Error as KeystoreError, Keystore, PlainText};
 use lockfile::{Lockfile, LockfileError};
-use std::fs::{read, write, OpenOptions};
+use std::fs::{read, write, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use tree_hash::TreeHash;
@@ -39,8 +39,6 @@ pub enum Error {
     /// generally caused by supplying an `amount` at deposit-time that is different to the one used
     /// at generation-time.
     Eth1DepositRootMismatch,
-    #[cfg(feature = "unencrypted_keys")]
-    SszKeypairError(String),
 }
 
 /// Information required to submit a deposit to the Eth1 deposit contract.
@@ -63,7 +61,7 @@ pub struct Eth1DepositData {
 pub struct ValidatorDir {
     dir: PathBuf,
     #[derivative(PartialEq = "ignore")]
-    lockfile: Lockfile,
+    _lockfile: Lockfile,
 }
 
 impl ValidatorDir {
@@ -85,7 +83,10 @@ impl ValidatorDir {
         let lockfile_path = dir.join(format!("{}.lock", VOTING_KEYSTORE_FILE));
         let lockfile = Lockfile::new(lockfile_path).map_err(Error::LockfileError)?;
 
-        Ok(Self { dir, lockfile })
+        Ok(Self {
+            dir,
+            _lockfile: lockfile,
+        })
     }
 
     /// Returns the `dir` provided to `Self::open`.
@@ -208,7 +209,7 @@ pub fn unlock_keypair<P: AsRef<Path>>(
     password_dir: P,
 ) -> Result<Keypair, Error> {
     let keystore = Keystore::from_json_reader(
-        &mut OpenOptions::new()
+        &mut File::options()
             .read(true)
             .create(false)
             .open(keystore_path)
@@ -216,9 +217,7 @@ pub fn unlock_keypair<P: AsRef<Path>>(
     )
     .map_err(Error::UnableToReadKeystore)?;
 
-    let password_path = password_dir
-        .as_ref()
-        .join(format!("0x{}", keystore.pubkey()));
+    let password_path = keystore_password_path(password_dir, &keystore);
     let password: PlainText = read(&password_path)
         .map_err(|_| Error::UnableToReadPassword(password_path))?
         .into();
@@ -233,7 +232,7 @@ pub fn unlock_keypair_from_password_path(
     password_path: &Path,
 ) -> Result<Keypair, Error> {
     let keystore = Keystore::from_json_reader(
-        &mut OpenOptions::new()
+        &mut File::options()
             .read(true)
             .create(false)
             .open(keystore_path)

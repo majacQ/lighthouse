@@ -1,29 +1,39 @@
-use beacon_chain::{BeaconChain, BeaconChainError, BeaconChainTypes};
-use types::ChainSpec;
+use beacon_chain::{BeaconChain, BeaconChainTypes};
+use types::{EthSpec, FixedBytesExtended, Hash256};
 
-use eth2_libp2p::rpc::StatusMessage;
+use lighthouse_network::rpc::StatusMessage;
 /// Trait to produce a `StatusMessage` representing the state of the given `beacon_chain`.
 ///
 /// NOTE: The purpose of this is simply to obtain a `StatusMessage` from the `BeaconChain` without
 /// polluting/coupling the type with RPC concepts.
 pub trait ToStatusMessage {
-    fn status_message(&self) -> Result<StatusMessage, BeaconChainError>;
+    fn status_message(&self) -> StatusMessage;
 }
 
 impl<T: BeaconChainTypes> ToStatusMessage for BeaconChain<T> {
-    fn status_message(&self) -> Result<StatusMessage, BeaconChainError> {
-        let head_info = self.head_info()?;
-        let genesis_validators_root = self.genesis_validators_root;
+    fn status_message(&self) -> StatusMessage {
+        status_message(self)
+    }
+}
 
-        let fork_digest =
-            ChainSpec::compute_fork_digest(head_info.fork.current_version, genesis_validators_root);
+/// Build a `StatusMessage` representing the state of the given `beacon_chain`.
+pub(crate) fn status_message<T: BeaconChainTypes>(beacon_chain: &BeaconChain<T>) -> StatusMessage {
+    let fork_digest = beacon_chain.enr_fork_id().fork_digest;
+    let cached_head = beacon_chain.canonical_head.cached_head();
+    let mut finalized_checkpoint = cached_head.finalized_checkpoint();
 
-        Ok(StatusMessage {
-            fork_digest,
-            finalized_root: head_info.finalized_checkpoint.root,
-            finalized_epoch: head_info.finalized_checkpoint.epoch,
-            head_root: head_info.block_root,
-            head_slot: head_info.slot,
-        })
+    // Alias the genesis checkpoint root to `0x00`.
+    let spec = &beacon_chain.spec;
+    let genesis_epoch = spec.genesis_slot.epoch(T::EthSpec::slots_per_epoch());
+    if finalized_checkpoint.epoch == genesis_epoch {
+        finalized_checkpoint.root = Hash256::zero();
+    }
+
+    StatusMessage {
+        fork_digest,
+        finalized_root: finalized_checkpoint.root,
+        finalized_epoch: finalized_checkpoint.epoch,
+        head_root: cached_head.head_block_root(),
+        head_slot: cached_head.head_slot(),
     }
 }

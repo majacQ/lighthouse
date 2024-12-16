@@ -2,22 +2,27 @@
 name = "operation_pool"
 version = "0.2.0"
 authors = ["Michael Sproul <michael@sigmaprime.io>"]
-edition = "2018"
+edition = { workspace = true }
 
 [dependencies]
-itertools = "0.10.0"
-int_to_bytes = { path = "../../consensus/int_to_bytes" }
-lazy_static = "1.4.0"
-lighthouse_metrics = { path = "../../common/lighthouse_metrics" }
-parking_lot = "0.11.0"
-types = { path = "../../consensus/types" }
-state_processing = { path = "../../consensus/state_processing" }
-eth2_ssz = "0.1.2"
-eth2_ssz_derive = "0.1.0"
-rayon = "1.5.0"
-serde = "1.0.116"
-serde_derive = "1.0.116"
-store = { path = "../store" }
+derivative = { workspace = true }
+itertools = { workspace = true }
+metrics = { workspace = true }
+parking_lot = { workspace = true }
+types = { workspace = true }
+state_processing = { workspace = true }
+ethereum_ssz = { workspace = true }
+ethereum_ssz_derive = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+store = { workspace = true }
+bitvec = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
-rand = "0.7.3"
+beacon_chain = { workspace = true }
+tokio = { workspace = true }
+maplit = { workspace = true }
+
+[features]
+portable = ["beacon_chain/portable"]

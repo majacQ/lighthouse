@@ -25,8 +25,7 @@ fn build_node<E: EthSpec>(env: &mut Environment<E>) -> LocalBeaconNode<E> {
 #[test]
 fn http_server_genesis_state() {
     let mut env = env_builder()
-        .null_logger()
-        //.async_logger("debug", None)
+        .test_logger()
         .expect("should build env logger")
         .multi_threaded_tokio_runtime()
         .expect("should start tokio runtime")
@@ -52,7 +51,7 @@ fn http_server_genesis_state() {
         .expect("client should have beacon chain")
         .state_at_slot(Slot::new(0), StateSkipConfig::WithStateRoots)
         .expect("should find state");
-    db_state.drop_all_caches();
+    db_state.drop_all_caches().unwrap();
 
     assert_eq!(
         api_state, db_state,

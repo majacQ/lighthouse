@@ -1,16 +1,14 @@
-#[macro_use]
-extern crate lazy_static;
-
 mod manual_slot_clock;
 mod metrics;
 mod system_time_slot_clock;
 
 use std::time::Duration;
 
-pub use crate::manual_slot_clock::ManualSlotClock;
 pub use crate::manual_slot_clock::ManualSlotClock as TestingSlotClock;
+pub use crate::manual_slot_clock::ManualSlotClock;
 pub use crate::system_time_slot_clock::SystemTimeSlotClock;
 pub use metrics::scrape_for_metrics;
+use types::consts::bellatrix::INTERVALS_PER_SLOT;
 pub use types::Slot;
 
 /// A clock that reports the current slot.
@@ -65,6 +63,9 @@ pub trait SlotClock: Send + Sync + Sized + Clone {
     /// Returns the first slot to be returned at the genesis time.
     fn genesis_slot(&self) -> Slot;
 
+    /// Returns the `Duration` from `UNIX_EPOCH` to the genesis time.
+    fn genesis_duration(&self) -> Duration;
+
     /// Returns the slot if the internal clock were advanced by `duration`.
     fn now_with_future_tolerance(&self, tolerance: Duration) -> Option<Slot> {
         self.slot_of(self.now_duration()?.checked_add(tolerance)?)
@@ -79,12 +80,67 @@ pub trait SlotClock: Send + Sync + Sized + Clone {
     /// Returns the delay between the start of the slot and when unaggregated attestations should be
     /// produced.
     fn unagg_attestation_production_delay(&self) -> Duration {
-        self.slot_duration() / 3
+        self.slot_duration() / INTERVALS_PER_SLOT as u32
+    }
+
+    /// Returns the delay between the start of the slot and when sync committee messages should be
+    /// produced.
+    fn sync_committee_message_production_delay(&self) -> Duration {
+        self.slot_duration() / INTERVALS_PER_SLOT as u32
     }
 
     /// Returns the delay between the start of the slot and when aggregated attestations should be
     /// produced.
     fn agg_attestation_production_delay(&self) -> Duration {
-        self.slot_duration() * 2 / 3
+        self.slot_duration() * 2 / INTERVALS_PER_SLOT as u32
+    }
+
+    /// Returns the delay between the start of the slot and when partially aggregated `SyncCommitteeContribution` should be
+    /// produced.
+    fn sync_committee_contribution_production_delay(&self) -> Duration {
+        self.slot_duration() * 2 / INTERVALS_PER_SLOT as u32
+    }
+
+    /// Returns the `Duration` since the start of the current `Slot` at seconds precision. Useful in determining whether to apply proposer boosts.
+    fn seconds_from_current_slot_start(&self) -> Option<Duration> {
+        self.now_duration()
+            .and_then(|now| now.checked_sub(self.genesis_duration()))
+            .map(|duration_into_slot| {
+                Duration::from_secs(duration_into_slot.as_secs() % self.slot_duration().as_secs())
+            })
+    }
+
+    /// Returns the `Duration` since the start of the current `Slot` at milliseconds precision.
+    fn millis_from_current_slot_start(&self) -> Option<Duration> {
+        self.now_duration()
+            .and_then(|now| now.checked_sub(self.genesis_duration()))
+            .map(|duration_into_slot| {
+                Duration::from_millis(
+                    (duration_into_slot.as_millis() % self.slot_duration().as_millis()) as u64,
+                )
+            })
+    }
+
+    /// Produces a *new* slot clock with the same configuration of `self`, except that clock is
+    /// "frozen" at the `freeze_at` time.
+    ///
+    /// This is useful for observing the slot clock at arbitrary fixed points in time.
+    fn freeze_at(&self, freeze_at: Duration) -> ManualSlotClock {
+        let slot_clock = ManualSlotClock::new(
+            self.genesis_slot(),
+            self.genesis_duration(),
+            self.slot_duration(),
+        );
+        slot_clock.set_current_time(freeze_at);
+        slot_clock
+    }
+
+    /// Returns the delay between the start of the slot and when a request for block components
+    /// missed over gossip in the current slot should be made via RPC.
+    ///
+    /// Currently set equal to 1/2 of the `unagg_attestation_production_delay`, but this may be
+    /// changed in the future.
+    fn single_lookup_delay(&self) -> Duration {
+        self.unagg_attestation_production_delay() / 2
     }
 }

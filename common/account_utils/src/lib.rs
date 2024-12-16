@@ -6,13 +6,19 @@ use eth2_wallet::{
     bip39::{Language, Mnemonic, MnemonicType},
     Wallet,
 };
+use filesystem::{create_with_600_perms, Error as FsError};
 use rand::{distributions::Alphanumeric, Rng};
-use serde_derive::{Deserialize, Serialize};
-use std::fs::{self, File};
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::io::prelude::*;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::str::from_utf8;
+use std::thread::sleep;
+use std::time::Duration;
+use std::{
+    fs::{self, File},
+    str::FromStr,
+};
 use zeroize::Zeroize;
 
 pub mod validator_definitions;
@@ -29,6 +35,10 @@ pub const MINIMUM_PASSWORD_LEN: usize = 12;
 /// 62**48 is greater than 255**32, therefore this password has more bits of entropy than a byte
 /// array of length 32.
 const DEFAULT_PASSWORD_LEN: usize = 48;
+
+pub const MNEMONIC_PROMPT: &str = "Enter the mnemonic phrase:";
+
+pub const STDIN_INPUTS_FLAG: &str = "stdin-inputs";
 
 /// Returns the "default" path where a wallet should store its password file.
 pub fn default_wallet_password_path<P: AsRef<Path>>(wallet_name: &str, secrets_dir: P) -> PathBuf {
@@ -59,31 +69,61 @@ pub fn read_password<P: AsRef<Path>>(path: P) -> Result<PlainText, io::Error> {
     fs::read(path).map(strip_off_newlines).map(Into::into)
 }
 
-/// Creates a file with `600 (-rw-------)` permissions.
-pub fn create_with_600_perms<P: AsRef<Path>>(path: P, bytes: &[u8]) -> Result<(), io::Error> {
-    let path = path.as_ref();
+/// Reads a password file into a `ZeroizeString` struct, with new-lines removed.
+pub fn read_password_string<P: AsRef<Path>>(path: P) -> Result<ZeroizeString, String> {
+    fs::read(path)
+        .map_err(|e| format!("Error opening file: {:?}", e))
+        .map(strip_off_newlines)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|e| format!("Error decoding utf8: {:?}", e))
+                .map(Into::into)
+        })
+}
 
-    let mut file = File::create(&path)?;
+/// Write a file atomically by using a temporary file as an intermediate.
+///
+/// Care is taken to preserve the permissions of the file at `file_path` being written.
+///
+/// If no file exists at `file_path` one will be created with restricted 0o600-equivalent
+/// permissions.
+pub fn write_file_via_temporary(
+    file_path: &Path,
+    temp_path: &Path,
+    bytes: &[u8],
+) -> Result<(), FsError> {
+    // If the file already exists, preserve its permissions by copying it.
+    // Otherwise, create a new file with restricted permissions.
+    if file_path.exists() {
+        fs::copy(file_path, temp_path).map_err(FsError::UnableToCopyFile)?;
+        fs::write(temp_path, bytes).map_err(FsError::UnableToWriteFile)?;
+    } else {
+        create_with_600_perms(temp_path, bytes)?;
+    }
 
-    let mut perm = file.metadata()?.permissions();
-
-    perm.set_mode(0o600);
-
-    file.set_permissions(perm)?;
-
-    file.write_all(bytes)?;
+    // With the temporary file created, perform an atomic rename.
+    fs::rename(temp_path, file_path).map_err(FsError::UnableToRenameFile)?;
 
     Ok(())
 }
 
-/// Generates a random alphanumeric password of length `DEFAULT_PASSWORD_LEN`.
+/// Generates a random alphanumeric password of length `DEFAULT_PASSWORD_LEN` as `PlainText`.
 pub fn random_password() -> PlainText {
+    random_password_raw_string().into_bytes().into()
+}
+
+/// Generates a random alphanumeric password of length `DEFAULT_PASSWORD_LEN` as `ZeroizeString`.
+pub fn random_password_string() -> ZeroizeString {
+    random_password_raw_string().into()
+}
+
+/// Common implementation for `random_password` and `random_password_string`.
+fn random_password_raw_string() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(DEFAULT_PASSWORD_LEN)
-        .collect::<String>()
-        .into_bytes()
-        .into()
+        .map(char::from)
+        .collect()
 }
 
 /// Remove any number of newline or carriage returns from the end of a vector of bytes.
@@ -178,6 +218,14 @@ pub fn mnemonic_from_phrase(phrase: &str) -> Result<Mnemonic, String> {
 #[serde(transparent)]
 pub struct ZeroizeString(String);
 
+impl FromStr for ZeroizeString {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_owned()))
+    }
+}
+
 impl From<String> for ZeroizeString {
     fn from(s: String) -> Self {
         Self(s)
@@ -191,7 +239,7 @@ impl ZeroizeString {
 
     /// Remove any number of newline or carriage returns from the end of a vector of bytes.
     pub fn without_newlines(&self) -> ZeroizeString {
-        let stripped_string = self.0.trim_end_matches(|c| c == '\r' || c == '\n').into();
+        let stripped_string = self.0.trim_end_matches(['\r', '\n']).into();
         Self(stripped_string)
     }
 }
@@ -200,6 +248,46 @@ impl AsRef<[u8]> for ZeroizeString {
     fn as_ref(&self) -> &[u8] {
         self.0.as_bytes()
     }
+}
+
+pub fn read_mnemonic_from_cli(
+    mnemonic_path: Option<PathBuf>,
+    stdin_inputs: bool,
+) -> Result<Mnemonic, String> {
+    let mnemonic = match mnemonic_path {
+        Some(path) => fs::read(&path)
+            .map_err(|e| format!("Unable to read {:?}: {:?}", path, e))
+            .and_then(|bytes| {
+                let bytes_no_newlines: PlainText = strip_off_newlines(bytes).into();
+                let phrase = from_utf8(bytes_no_newlines.as_ref())
+                    .map_err(|e| format!("Unable to derive mnemonic: {:?}", e))?;
+                Mnemonic::from_phrase(phrase, Language::English).map_err(|e| {
+                    format!(
+                        "Unable to derive mnemonic from string {:?}: {:?}",
+                        phrase, e
+                    )
+                })
+            })?,
+        None => loop {
+            eprintln!();
+            eprintln!("{}", MNEMONIC_PROMPT);
+
+            let mnemonic = read_input_from_user(stdin_inputs)?;
+
+            match Mnemonic::from_phrase(mnemonic.as_str(), Language::English) {
+                Ok(mnemonic_m) => {
+                    eprintln!("Valid mnemonic provided.");
+                    eprintln!();
+                    sleep(Duration::from_secs(1));
+                    break mnemonic_m;
+                }
+                Err(_) => {
+                    eprintln!("Invalid mnemonic");
+                }
+            }
+        },
+    };
+    Ok(mnemonic)
 }
 
 #[cfg(test)]

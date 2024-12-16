@@ -5,7 +5,7 @@
 //! duplication and protect against some easy-to-make mistakes when performing state advances.
 
 use crate::*;
-use types::{BeaconState, ChainSpec, EthSpec, Hash256, Slot};
+use types::{BeaconState, ChainSpec, EthSpec, FixedBytesExtended, Hash256, Slot};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -25,15 +25,15 @@ pub enum Error {
 ///
 /// This state advance method is "complete"; it outputs a perfectly valid `BeaconState` and doesn't
 /// do anything hacky like the "partial" method (see `partial_state_advance`).
-pub fn complete_state_advance<T: EthSpec>(
-    state: &mut BeaconState<T>,
+pub fn complete_state_advance<E: EthSpec>(
+    state: &mut BeaconState<E>,
     mut state_root_opt: Option<Hash256>,
     target_slot: Slot,
     spec: &ChainSpec,
 ) -> Result<(), Error> {
-    check_target_slot(state.slot, target_slot)?;
+    check_target_slot(state.slot(), target_slot)?;
 
-    while state.slot < target_slot {
+    while state.slot() < target_slot {
         // Use the initial state root on the first iteration of the loop, then use `None`  for any
         // future iterations.
         let state_root_opt = state_root_opt.take();
@@ -58,13 +58,13 @@ pub fn complete_state_advance<T: EthSpec>(
 ///
 /// - If `state.slot > target_slot`, an error will be returned.
 /// - If `state_root_opt.is_none()` but the latest block header requires a state root.
-pub fn partial_state_advance<T: EthSpec>(
-    state: &mut BeaconState<T>,
+pub fn partial_state_advance<E: EthSpec>(
+    state: &mut BeaconState<E>,
     state_root_opt: Option<Hash256>,
     target_slot: Slot,
     spec: &ChainSpec,
 ) -> Result<(), Error> {
-    check_target_slot(state.slot, target_slot)?;
+    check_target_slot(state.slot(), target_slot)?;
 
     // The only time that a state root is mandatory is if a block has been applied to the state
     // without it yet being advanced another slot.
@@ -72,13 +72,13 @@ pub fn partial_state_advance<T: EthSpec>(
     // Failing to provide a state root in this scenario would result in corrupting the
     // `state.block_roots` array, since the `state.latest_block_header` would contain an invalid
     // (all-zeros) state root.
-    let mut initial_state_root = Some(if state.slot > state.latest_block_header.slot {
+    let mut initial_state_root = Some(if state.slot() > state.latest_block_header().slot {
         state_root_opt.unwrap_or_else(Hash256::zero)
     } else {
         state_root_opt.ok_or(Error::StateRootNotProvided)?
     });
 
-    while state.slot < target_slot {
+    while state.slot() < target_slot {
         // Use the initial state root on the first iteration of the loop, then use `[0; 32]` for any
         // later iterations.
         //

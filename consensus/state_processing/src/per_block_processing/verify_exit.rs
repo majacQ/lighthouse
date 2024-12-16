@@ -18,47 +18,24 @@ fn error(reason: ExitInvalid) -> BlockOperationError<ExitInvalid> {
 /// Returns `Ok(())` if the `Exit` is valid, otherwise indicates the reason for invalidity.
 ///
 /// Spec v0.12.1
-pub fn verify_exit<T: EthSpec>(
-    state: &BeaconState<T>,
-    exit: &SignedVoluntaryExit,
-    verify_signatures: VerifySignatures,
-    spec: &ChainSpec,
-) -> Result<()> {
-    verify_exit_parametric(state, exit, verify_signatures, spec, false)
-}
-
-/// Like `verify_exit` but doesn't run checks which may become true in future states.
-///
-/// Spec v0.12.1
-pub fn verify_exit_time_independent_only<T: EthSpec>(
-    state: &BeaconState<T>,
-    exit: &SignedVoluntaryExit,
-    verify_signatures: VerifySignatures,
-    spec: &ChainSpec,
-) -> Result<()> {
-    verify_exit_parametric(state, exit, verify_signatures, spec, true)
-}
-
-/// Parametric version of `verify_exit` that skips some checks if `time_independent_only` is true.
-///
-/// Spec v0.12.1
-fn verify_exit_parametric<T: EthSpec>(
-    state: &BeaconState<T>,
+pub fn verify_exit<E: EthSpec>(
+    state: &BeaconState<E>,
+    current_epoch: Option<Epoch>,
     signed_exit: &SignedVoluntaryExit,
     verify_signatures: VerifySignatures,
     spec: &ChainSpec,
-    time_independent_only: bool,
 ) -> Result<()> {
+    let current_epoch = current_epoch.unwrap_or(state.current_epoch());
     let exit = &signed_exit.message;
 
     let validator = state
-        .validators
+        .validators()
         .get(exit.validator_index as usize)
         .ok_or_else(|| error(ExitInvalid::ValidatorUnknown(exit.validator_index)))?;
 
     // Verify the validator is active.
     verify!(
-        validator.is_active_at(state.current_epoch()),
+        validator.is_active_at(current_epoch),
         ExitInvalid::NotActive(exit.validator_index)
     );
 
@@ -70,9 +47,9 @@ fn verify_exit_parametric<T: EthSpec>(
 
     // Exits must specify an epoch when they become valid; they are not valid before then.
     verify!(
-        time_independent_only || state.current_epoch() >= exit.epoch,
+        current_epoch >= exit.epoch,
         ExitInvalid::FutureEpoch {
-            state: state.current_epoch(),
+            state: current_epoch,
             exit: exit.epoch
         }
     );
@@ -82,9 +59,9 @@ fn verify_exit_parametric<T: EthSpec>(
         .activation_epoch
         .safe_add(spec.shard_committee_period)?;
     verify!(
-        state.current_epoch() >= earliest_exit_epoch,
+        current_epoch >= earliest_exit_epoch,
         ExitInvalid::TooYoungToExit {
-            current_epoch: state.current_epoch(),
+            current_epoch,
             earliest_exit_epoch,
         }
     );
@@ -99,6 +76,17 @@ fn verify_exit_parametric<T: EthSpec>(
             )?
             .verify(),
             ExitInvalid::BadSignature
+        );
+    }
+
+    // [New in Electra:EIP7251]
+    // Only exit validator if it has no pending withdrawals in the queue
+    if let Ok(pending_balance_to_withdraw) =
+        state.get_pending_balance_to_withdraw(exit.validator_index as usize)
+    {
+        verify!(
+            pending_balance_to_withdraw == 0,
+            ExitInvalid::PendingWithdrawalInQueue(exit.validator_index)
         );
     }
 

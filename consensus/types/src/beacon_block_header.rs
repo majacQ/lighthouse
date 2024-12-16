@@ -1,7 +1,7 @@
 use crate::test_utils::TestRandom;
 use crate::*;
 
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use test_random_derive::TestRandom;
 use tree_hash::TreeHash;
@@ -10,9 +10,19 @@ use tree_hash_derive::TreeHash;
 /// A header of a `BeaconBlock`.
 ///
 /// Spec v0.12.1
-#[cfg_attr(feature = "arbitrary-fuzz", derive(arbitrary::Arbitrary))]
 #[derive(
-    Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Encode, Decode, TreeHash, TestRandom,
+    arbitrary::Arbitrary,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Clone,
+    Serialize,
+    Deserialize,
+    Encode,
+    Decode,
+    TreeHash,
+    TestRandom,
 )]
 pub struct BeaconBlockHeader {
     pub slot: Slot,
@@ -33,19 +43,6 @@ impl BeaconBlockHeader {
         Hash256::from_slice(&self.tree_hash_root()[..])
     }
 
-    /// Given a `body`, consumes `self` and returns a complete `BeaconBlock`.
-    ///
-    /// Spec v0.12.1
-    pub fn into_block<T: EthSpec>(self, body: BeaconBlockBody<T>) -> BeaconBlock<T> {
-        BeaconBlock {
-            slot: self.slot,
-            proposer_index: self.proposer_index,
-            parent_root: self.parent_root,
-            state_root: self.state_root,
-            body,
-        }
-    }
-
     /// Signs `self`, producing a `SignedBeaconBlockHeader`.
     pub fn sign<E: EthSpec>(
         self,
@@ -61,6 +58,16 @@ impl BeaconBlockHeader {
         SignedBeaconBlockHeader {
             message: self,
             signature,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            body_root: Default::default(),
+            parent_root: Default::default(),
+            proposer_index: Default::default(),
+            slot: Default::default(),
+            state_root: Default::default(),
         }
     }
 }

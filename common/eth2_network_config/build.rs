@@ -1,21 +1,10 @@
 //! Extracts zipped genesis states on first run.
 use eth2_config::{
-    altona, mainnet, medalla, prater, pyrmont, spadina, toledo, Eth2NetArchiveAndDirectory,
-    GENESIS_FILE_NAME,
+    Eth2NetArchiveAndDirectory, GenesisStateSource, ETH2_NET_DIRS, GENESIS_FILE_NAME,
 };
 use std::fs::File;
 use std::io;
 use zip::ZipArchive;
-
-const ETH2_NET_DIRS: &[Eth2NetArchiveAndDirectory<'static>] = &[
-    altona::ETH2_NET_DIR,
-    medalla::ETH2_NET_DIR,
-    spadina::ETH2_NET_DIR,
-    mainnet::ETH2_NET_DIR,
-    pyrmont::ETH2_NET_DIR,
-    toledo::ETH2_NET_DIR,
-    prater::ETH2_NET_DIR,
-];
 
 fn main() {
     for network in ETH2_NET_DIRS {
@@ -39,7 +28,7 @@ fn uncompress_state(network: &Eth2NetArchiveAndDirectory<'static>) -> Result<(),
         return Ok(());
     }
 
-    if network.genesis_is_known {
+    if network.genesis_state_source == GenesisStateSource::IncludedBytes {
         // Extract genesis state from genesis.ssz.zip
         let archive_path = network.genesis_state_archive();
         let archive_file = File::open(&archive_path)
@@ -59,7 +48,8 @@ fn uncompress_state(network: &Eth2NetArchiveAndDirectory<'static>) -> Result<(),
         io::copy(&mut file, &mut outfile)
             .map_err(|e| format!("Error writing file {:?}: {}", genesis_ssz_path, e))?;
     } else {
-        // Create empty genesis.ssz if genesis is unknown
+        // Create empty genesis.ssz if genesis is unknown or to be downloaded via URL.
+        // This is a bit of a hack to make `include_bytes!` easier to deal with.
         File::create(genesis_ssz_path)
             .map_err(|e| format!("Failed to create {}: {}", GENESIS_FILE_NAME, e))?;
     }

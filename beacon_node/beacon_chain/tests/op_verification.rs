@@ -2,83 +2,84 @@
 
 #![cfg(not(debug_assertions))]
 
-#[macro_use]
-extern crate lazy_static;
-
-use beacon_chain::observed_operations::ObservationOutcome;
-use beacon_chain::test_utils::{
-    AttestationStrategy, BeaconChainHarness, BlockStrategy, DiskHarnessType,
+use beacon_chain::{
+    observed_operations::ObservationOutcome,
+    test_utils::{
+        test_spec, AttestationStrategy, BeaconChainHarness, BlockStrategy, DiskHarnessType,
+    },
+    BeaconChainError,
 };
 use sloggers::{null::NullLoggerBuilder, Build};
-use std::sync::Arc;
+use state_processing::per_block_processing::errors::{
+    AttesterSlashingInvalid, BlockOperationError, ExitInvalid, ProposerSlashingInvalid,
+};
+use std::sync::{Arc, LazyLock};
 use store::{LevelDB, StoreConfig};
 use tempfile::{tempdir, TempDir};
-use types::test_utils::{
-    AttesterSlashingTestTask, ProposerSlashingTestTask, TestingAttesterSlashingBuilder,
-    TestingProposerSlashingBuilder, TestingVoluntaryExitBuilder,
-};
 use types::*;
 
 pub const VALIDATOR_COUNT: usize = 24;
 
-lazy_static! {
-    /// A cached set of keys.
-    static ref KEYPAIRS: Vec<Keypair> =
-        types::test_utils::generate_deterministic_keypairs(VALIDATOR_COUNT);
-}
+/// A cached set of keys.
+static KEYPAIRS: LazyLock<Vec<Keypair>> =
+    LazyLock::new(|| types::test_utils::generate_deterministic_keypairs(VALIDATOR_COUNT));
 
 type E = MinimalEthSpec;
 type TestHarness = BeaconChainHarness<DiskHarnessType<E>>;
 type HotColdDB = store::HotColdDB<E, LevelDB<E>, LevelDB<E>>;
 
 fn get_store(db_path: &TempDir) -> Arc<HotColdDB> {
-    let spec = E::default_spec();
+    let spec = Arc::new(test_spec::<E>());
     let hot_path = db_path.path().join("hot_db");
     let cold_path = db_path.path().join("cold_db");
+    let blobs_path = db_path.path().join("blobs_db");
     let config = StoreConfig::default();
     let log = NullLoggerBuilder.build().expect("logger should build");
-    HotColdDB::open(&hot_path, &cold_path, |_, _, _| Ok(()), config, spec, log)
-        .expect("disk store should initialize")
+    HotColdDB::open(
+        &hot_path,
+        &cold_path,
+        &blobs_path,
+        |_, _, _| Ok(()),
+        config,
+        spec,
+        log,
+    )
+    .expect("disk store should initialize")
 }
 
 fn get_harness(store: Arc<HotColdDB>, validator_count: usize) -> TestHarness {
-    let harness = BeaconChainHarness::new_with_disk_store(
-        MinimalEthSpec,
-        store,
-        KEYPAIRS[0..validator_count].to_vec(),
-    );
+    let harness = BeaconChainHarness::builder(MinimalEthSpec)
+        .default_spec()
+        .keypairs(KEYPAIRS[0..validator_count].to_vec())
+        .fresh_disk_store(store)
+        .mock_execution_layer()
+        .build();
     harness.advance_slot();
     harness
 }
 
-#[test]
-fn voluntary_exit() {
+#[tokio::test]
+async fn voluntary_exit() {
     let db_path = tempdir().unwrap();
     let store = get_store(&db_path);
     let harness = get_harness(store.clone(), VALIDATOR_COUNT);
     let spec = &harness.chain.spec.clone();
 
-    harness.extend_chain(
-        (E::slots_per_epoch() * (spec.shard_committee_period + 1)) as usize,
-        BlockStrategy::OnCanonicalHead,
-        AttestationStrategy::AllValidators,
-    );
-
-    let head_info = harness.chain.head_info().unwrap();
-
-    let make_exit = |validator_index: usize, exit_epoch: u64| {
-        TestingVoluntaryExitBuilder::new(Epoch::new(exit_epoch), validator_index as u64).build(
-            &KEYPAIRS[validator_index].sk,
-            &head_info.fork,
-            head_info.genesis_validators_root,
-            spec,
+    harness
+        .extend_chain(
+            (E::slots_per_epoch() * (spec.shard_committee_period + 1)) as usize,
+            BlockStrategy::OnCanonicalHead,
+            AttestationStrategy::AllValidators,
         )
-    };
+        .await;
 
     let validator_index1 = VALIDATOR_COUNT - 1;
     let validator_index2 = VALIDATOR_COUNT - 2;
 
-    let exit1 = make_exit(validator_index1, spec.shard_committee_period);
+    let exit1 = harness.make_voluntary_exit(
+        validator_index1 as u64,
+        Epoch::new(spec.shard_committee_period),
+    );
 
     // First verification should show it to be fresh.
     assert!(matches!(
@@ -98,14 +99,20 @@ fn voluntary_exit() {
     ));
 
     // A different exit for the same validator should also be detected as a duplicate.
-    let exit2 = make_exit(validator_index1, spec.shard_committee_period + 1);
+    let exit2 = harness.make_voluntary_exit(
+        validator_index1 as u64,
+        Epoch::new(spec.shard_committee_period + 1),
+    );
     assert!(matches!(
         harness.chain.verify_voluntary_exit_for_gossip(exit2),
         Ok(ObservationOutcome::AlreadyKnown)
     ));
 
     // Exit for a different validator should be fine.
-    let exit3 = make_exit(validator_index2, spec.shard_committee_period);
+    let exit3 = harness.make_voluntary_exit(
+        validator_index2 as u64,
+        Epoch::new(spec.shard_committee_period),
+    );
     assert!(matches!(
         harness
             .chain
@@ -115,30 +122,85 @@ fn voluntary_exit() {
     ));
 }
 
-#[test]
-fn proposer_slashing() {
+#[tokio::test]
+async fn voluntary_exit_duplicate_in_state() {
     let db_path = tempdir().unwrap();
     let store = get_store(&db_path);
     let harness = get_harness(store.clone(), VALIDATOR_COUNT);
     let spec = &harness.chain.spec;
 
-    let head_info = harness.chain.head_info().unwrap();
+    harness
+        .extend_chain(
+            (E::slots_per_epoch() * (spec.shard_committee_period + 1)) as usize,
+            BlockStrategy::OnCanonicalHead,
+            AttestationStrategy::AllValidators,
+        )
+        .await;
+    harness.advance_slot();
+
+    // Exit a validator.
+    let exited_validator = 0;
+    let exit =
+        harness.make_voluntary_exit(exited_validator, Epoch::new(spec.shard_committee_period));
+    let ObservationOutcome::New(verified_exit) = harness
+        .chain
+        .verify_voluntary_exit_for_gossip(exit.clone())
+        .unwrap()
+    else {
+        panic!("exit should verify");
+    };
+    harness.chain.import_voluntary_exit(verified_exit);
+
+    // Make a new block to include the exit.
+    harness
+        .extend_chain(
+            1,
+            BlockStrategy::OnCanonicalHead,
+            AttestationStrategy::AllValidators,
+        )
+        .await;
+
+    // Verify validator is actually exited.
+    assert_ne!(
+        harness
+            .get_current_state()
+            .validators()
+            .get(exited_validator as usize)
+            .unwrap()
+            .exit_epoch,
+        spec.far_future_epoch
+    );
+
+    // Clear the in-memory gossip cache & try to verify the same exit on gossip.
+    // It should still fail because gossip verification should check the validator's `exit_epoch`
+    // field in the head state.
+    harness
+        .chain
+        .observed_voluntary_exits
+        .lock()
+        .__reset_for_testing_only();
+
+    assert!(matches!(
+        harness
+            .chain
+            .verify_voluntary_exit_for_gossip(exit)
+            .unwrap_err(),
+        BeaconChainError::ExitValidationError(BlockOperationError::Invalid(
+            ExitInvalid::AlreadyExited(index)
+        )) if index == exited_validator
+    ));
+}
+
+#[test]
+fn proposer_slashing() {
+    let db_path = tempdir().unwrap();
+    let store = get_store(&db_path);
+    let harness = get_harness(store.clone(), VALIDATOR_COUNT);
 
     let validator_index1 = VALIDATOR_COUNT - 1;
     let validator_index2 = VALIDATOR_COUNT - 2;
 
-    let make_slashing = |validator_index: usize| {
-        TestingProposerSlashingBuilder::double_vote::<E>(
-            ProposerSlashingTestTask::Valid,
-            validator_index as u64,
-            &KEYPAIRS[validator_index].sk,
-            &head_info.fork,
-            head_info.genesis_validators_root,
-            spec,
-        )
-    };
-
-    let slashing1 = make_slashing(validator_index1);
+    let slashing1 = harness.make_proposer_slashing(validator_index1 as u64);
 
     // First slashing for this proposer should be allowed.
     assert!(matches!(
@@ -171,7 +233,7 @@ fn proposer_slashing() {
     ));
 
     // Proposer slashing for a different index should be accepted
-    let slashing3 = make_slashing(validator_index2);
+    let slashing3 = harness.make_proposer_slashing(validator_index2 as u64);
     assert!(matches!(
         harness
             .chain
@@ -181,14 +243,68 @@ fn proposer_slashing() {
     ));
 }
 
+#[tokio::test]
+async fn proposer_slashing_duplicate_in_state() {
+    let db_path = tempdir().unwrap();
+    let store = get_store(&db_path);
+    let harness = get_harness(store.clone(), VALIDATOR_COUNT);
+
+    // Slash a validator.
+    let slashed_validator = 0;
+    let slashing = harness.make_proposer_slashing(slashed_validator);
+    let ObservationOutcome::New(verified_slashing) = harness
+        .chain
+        .verify_proposer_slashing_for_gossip(slashing.clone())
+        .unwrap()
+    else {
+        panic!("slashing should verify");
+    };
+    harness.chain.import_proposer_slashing(verified_slashing);
+
+    // Make a new block to include the slashing.
+    harness
+        .extend_chain(
+            1,
+            BlockStrategy::OnCanonicalHead,
+            AttestationStrategy::AllValidators,
+        )
+        .await;
+
+    // Verify validator is actually slashed.
+    assert!(
+        harness
+            .get_current_state()
+            .validators()
+            .get(slashed_validator as usize)
+            .unwrap()
+            .slashed
+    );
+
+    // Clear the in-memory gossip cache & try to verify the same slashing on gossip.
+    // It should still fail because gossip verification should check the validator's `slashed` field
+    // in the head state.
+    harness
+        .chain
+        .observed_proposer_slashings
+        .lock()
+        .__reset_for_testing_only();
+
+    assert!(matches!(
+        harness
+            .chain
+            .verify_proposer_slashing_for_gossip(slashing)
+            .unwrap_err(),
+        BeaconChainError::ProposerSlashingValidationError(BlockOperationError::Invalid(
+            ProposerSlashingInvalid::ProposerNotSlashable(index)
+        )) if index == slashed_validator
+    ));
+}
+
 #[test]
 fn attester_slashing() {
     let db_path = tempdir().unwrap();
     let store = get_store(&db_path);
     let harness = get_harness(store.clone(), VALIDATOR_COUNT);
-    let spec = &harness.chain.spec;
-
-    let head_info = harness.chain.head_info().unwrap();
 
     // First third of the validators
     let first_third = (0..VALIDATOR_COUNT as u64 / 3).collect::<Vec<_>>();
@@ -199,25 +315,8 @@ fn attester_slashing() {
     // Last half of the validators
     let second_half = (VALIDATOR_COUNT as u64 / 2..VALIDATOR_COUNT as u64).collect::<Vec<_>>();
 
-    let signer = |idx: u64, message: &[u8]| {
-        KEYPAIRS[idx as usize]
-            .sk
-            .sign(Hash256::from_slice(&message))
-    };
-
-    let make_slashing = |validators| {
-        TestingAttesterSlashingBuilder::double_vote::<_, E>(
-            AttesterSlashingTestTask::Valid,
-            validators,
-            signer,
-            &head_info.fork,
-            head_info.genesis_validators_root,
-            spec,
-        )
-    };
-
     // Slashing for first third of validators should be accepted.
-    let slashing1 = make_slashing(&first_third);
+    let slashing1 = harness.make_attester_slashing(first_third);
     assert!(matches!(
         harness
             .chain
@@ -227,7 +326,7 @@ fn attester_slashing() {
     ));
 
     // Overlapping slashing for first half of validators should also be accepted.
-    let slashing2 = make_slashing(&first_half);
+    let slashing2 = harness.make_attester_slashing(first_half);
     assert!(matches!(
         harness
             .chain
@@ -253,7 +352,7 @@ fn attester_slashing() {
     ));
 
     // Slashing for last half of validators should be accepted (distinct from all existing)
-    let slashing3 = make_slashing(&second_half);
+    let slashing3 = harness.make_attester_slashing(second_half);
     assert!(matches!(
         harness
             .chain
@@ -262,12 +361,69 @@ fn attester_slashing() {
         ObservationOutcome::New(_)
     ));
     // Slashing for last third (contained in last half) should be rejected.
-    let slashing4 = make_slashing(&last_third);
+    let slashing4 = harness.make_attester_slashing(last_third);
     assert!(matches!(
         harness
             .chain
             .verify_attester_slashing_for_gossip(slashing4)
             .unwrap(),
         ObservationOutcome::AlreadyKnown
+    ));
+}
+
+#[tokio::test]
+async fn attester_slashing_duplicate_in_state() {
+    let db_path = tempdir().unwrap();
+    let store = get_store(&db_path);
+    let harness = get_harness(store.clone(), VALIDATOR_COUNT);
+
+    // Slash a validator.
+    let slashed_validator = 0;
+    let slashing = harness.make_attester_slashing(vec![slashed_validator]);
+    let ObservationOutcome::New(verified_slashing) = harness
+        .chain
+        .verify_attester_slashing_for_gossip(slashing.clone())
+        .unwrap()
+    else {
+        panic!("slashing should verify");
+    };
+    harness.chain.import_attester_slashing(verified_slashing);
+
+    // Make a new block to include the slashing.
+    harness
+        .extend_chain(
+            1,
+            BlockStrategy::OnCanonicalHead,
+            AttestationStrategy::AllValidators,
+        )
+        .await;
+
+    // Verify validator is actually slashed.
+    assert!(
+        harness
+            .get_current_state()
+            .validators()
+            .get(slashed_validator as usize)
+            .unwrap()
+            .slashed
+    );
+
+    // Clear the in-memory gossip cache & try to verify the same slashing on gossip.
+    // It should still fail because gossip verification should check the validator's `slashed` field
+    // in the head state.
+    harness
+        .chain
+        .observed_attester_slashings
+        .lock()
+        .__reset_for_testing_only();
+
+    assert!(matches!(
+        harness
+            .chain
+            .verify_attester_slashing_for_gossip(slashing)
+            .unwrap_err(),
+        BeaconChainError::AttesterSlashingValidationError(BlockOperationError::Invalid(
+            AttesterSlashingInvalid::NoSlashableIndices
+        ))
     ));
 }

@@ -1,4 +1,7 @@
-use types::{BeaconBlock, BeaconState, Checkpoint, EthSpec, Hash256, Slot};
+use proto_array::JustifiedBalances;
+use std::collections::BTreeSet;
+use std::fmt::Debug;
+use types::{AbstractExecPayload, BeaconBlockRef, BeaconState, Checkpoint, EthSpec, Hash256, Slot};
 
 /// Approximates the `Store` in "Ethereum 2.0 Phase 0 -- Beacon Chain Fork Choice":
 ///
@@ -16,10 +19,10 @@ use types::{BeaconBlock, BeaconState, Checkpoint, EthSpec, Hash256, Slot};
 /// The primary motivation for defining this as a trait to be implemented upstream rather than a
 /// concrete struct is to allow this crate to be free from "impure" on-disk database logic,
 /// hopefully making auditing easier.
-pub trait ForkChoiceStore<T: EthSpec>: Sized {
-    type Error;
+pub trait ForkChoiceStore<E: EthSpec>: Sized {
+    type Error: Debug;
 
-    /// Returns the last value passed to `Self::update_time`.
+    /// Returns the last value passed to `Self::set_current_slot`.
     fn get_current_slot(&self) -> Slot;
 
     /// Set the value to be returned by `Self::get_current_slot`.
@@ -31,24 +34,30 @@ pub trait ForkChoiceStore<T: EthSpec>: Sized {
 
     /// Called whenever `ForkChoice::on_block` has verified a block, but not yet added it to fork
     /// choice. Allows the implementer to performing caching or other housekeeping duties.
-    fn on_verified_block(
+    fn on_verified_block<Payload: AbstractExecPayload<E>>(
         &mut self,
-        block: &BeaconBlock<T>,
+        block: BeaconBlockRef<E, Payload>,
         block_root: Hash256,
-        state: &BeaconState<T>,
+        state: &BeaconState<E>,
     ) -> Result<(), Self::Error>;
 
     /// Returns the `justified_checkpoint`.
     fn justified_checkpoint(&self) -> &Checkpoint;
 
     /// Returns balances from the `state` identified by `justified_checkpoint.root`.
-    fn justified_balances(&self) -> &[u64];
-
-    /// Returns the `best_justified_checkpoint`.
-    fn best_justified_checkpoint(&self) -> &Checkpoint;
+    fn justified_balances(&self) -> &JustifiedBalances;
 
     /// Returns the `finalized_checkpoint`.
     fn finalized_checkpoint(&self) -> &Checkpoint;
+
+    /// Returns the `unrealized_justified_checkpoint`.
+    fn unrealized_justified_checkpoint(&self) -> &Checkpoint;
+
+    /// Returns the `unrealized_finalized_checkpoint`.
+    fn unrealized_finalized_checkpoint(&self) -> &Checkpoint;
+
+    /// Returns the `proposer_boost_root`.
+    fn proposer_boost_root(&self) -> Hash256;
 
     /// Sets `finalized_checkpoint`.
     fn set_finalized_checkpoint(&mut self, checkpoint: Checkpoint);
@@ -56,6 +65,18 @@ pub trait ForkChoiceStore<T: EthSpec>: Sized {
     /// Sets the `justified_checkpoint`.
     fn set_justified_checkpoint(&mut self, checkpoint: Checkpoint) -> Result<(), Self::Error>;
 
-    /// Sets the `best_justified_checkpoint`.
-    fn set_best_justified_checkpoint(&mut self, checkpoint: Checkpoint);
+    /// Sets the `unrealized_justified_checkpoint`.
+    fn set_unrealized_justified_checkpoint(&mut self, checkpoint: Checkpoint);
+
+    /// Sets the `unrealized_finalized_checkpoint`.
+    fn set_unrealized_finalized_checkpoint(&mut self, checkpoint: Checkpoint);
+
+    /// Sets the proposer boost root.
+    fn set_proposer_boost_root(&mut self, proposer_boost_root: Hash256);
+
+    /// Gets the equivocating indices.
+    fn equivocating_indices(&self) -> &BTreeSet<u64>;
+
+    /// Adds to the set of equivocating indices.
+    fn extend_equivocating_indices(&mut self, indices: impl IntoIterator<Item = u64>);
 }
